@@ -1,0 +1,37 @@
+[package]
+name = "dbgen"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Schema-agnostic, deterministic synthetic data generator: compiles SQL DDL, generates consistent rows and bulk-loads them"
+license = "UNLICENSED"
+publish = false
+
+[[bin]]
+name = "dbgen"
+path = "src/main.rs"
+
+[lib]
+name = "dbgen"
+path = "src/lib.rs"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+crossbeam-channel = "0.5"
+ctrlc = "3.4"
+indicatif = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+sqlparser = "0.64"
+strsim = "0.11"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+ureq = "2.12"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+debug = "line-tables-only"

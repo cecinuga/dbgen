@@ -1,0 +1,32 @@
+# A throwaway ClickHouse for trying dbgen and for its integration tests.
+#
+#   docker compose up -d        # ClickHouse 26.8, HTTP on localhost:18123, user dbgen / dbgen
+#
+# Integration tests: DBGEN_TEST_CLICKHOUSE_URL=http://dbgen:dbgen@localhost:18123
+name: dbgen
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8
+    container_name: dbgen-clickhouse
+    environment:
+      CLICKHOUSE_USER: dbgen
+      CLICKHOUSE_PASSWORD: dbgen
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "127.0.0.1:${DBGEN_CH_PORT:-18123}:8123"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+volumes:
+  clickhouse-data:

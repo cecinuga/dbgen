@@ -1,0 +1,69 @@
+# Stress series 2: 150,000 rows per fact table, in database agevola_stress_2.
+# Same tables, relations and column settings as ../dbgen.yaml.
+#
+#   scripts/run-stress-suite.sh examples/agevola/stress/*.yaml
+database: "http://dbgen:dbgen@localhost:18123/agevola_stress_2"
+schema: ../../../../reporting-etl-service/sql/migrations
+
+generation:
+  seed: 42
+  batch_size: 100000
+  workers: 4
+  history_days: 365
+  end_time: "2026-11-01"
+
+tables:
+  dim_floor: 4
+  dim_room_type: 2
+  dim_room: 40
+  dim_bed_type: 2
+  dim_bed: 60
+  dim_alarm_types: 5
+  dim_device: 60
+  dim_team: 10
+  dim_posture_protocol: 3
+  dim_patient: 60
+  dim_staff: 212
+  dim_location: 60
+  dim_room_version: 40
+  dim_floor_version: 4
+  fact_patient_occupancy: 150000
+  fact_device_assignment: 150000
+  fact_staff_team_membership: 150000
+  fact_staff_responsibility: 150000
+  fact_alarms: 150000
+  fact_device_vitals_compact: 150000
+  fact_bed_status: 150000
+  fact_room_status: 150000
+  fact_floor_status: 150000
+  fact_blackouts: 150000
+  fact_posture_assignments: 150000
+  fact_posture_movements: 150000
+  fact_media_records: 150000
+  fact_staff_activity: 150000
+  fact_device_bed_state_changes: 150000
+  fact_vitals_daily: 365
+  etl_load_checkpoint: skip
+  etl_dead_letter: skip
+
+# References the column names do not reveal (inferred ones are listed by `dbgen inspect`).
+relations:
+  - "dim_floor.area_type -> dim_area_type.area_type_name"
+  - "dim_room.room_type -> dim_room_type.room_type_name"
+  - "dim_bed.bed_type -> dim_bed_type.bed_type_name"
+  - "dim_alarm_types.category -> dim_alarm_category.category_name"
+  - "fact_alarms.alarm_type -> dim_alarm_types.name"
+  - "fact_alarms.(sla_category, sla_priority) -> dim_alarm_sla_target.(category_name, priority_name)"
+  - "fact_bed_status.bed_status -> dim_bed_status.bed_status_name"
+  - "fact_room_status.room_status -> dim_room_status.room_status_name"
+  - "fact_floor_status.floor_status -> dim_floor_status.floor_status_name"
+  - "fact_staff_responsibility.entity_key -> dim_location.location_key"
+  - "fact_device_assignment.assigned_entity_key -> dim_location.location_key"
+  - { from: "fact_alarms.patient_key", to: "dim_patient.patient_key", distribution: skewed, skew: 2 }
+
+columns:
+  fact_alarms.severity: { values: [LOW, MEDIUM, HIGH, CRITICAL], weights: [50, 30, 15, 5] }
+  fact_alarms.alarm_status: { values: [OPEN, IN_PROGRESS, RESOLVED], weights: [5, 5, 90] }
+  fact_alarms.acknowledgment_timestamp: { after: trigger_timestamp, gap: [10s, 30m], null_rate: 0.05 }
+  fact_alarms.resolution_timestamp: { after: acknowledgment_timestamp, gap: [1m, 4h], null_rate: 0.08 }
+  dim_patient.gender: { values: [M, F] }
