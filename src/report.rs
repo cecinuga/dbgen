@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::engine::Stats;
 use crate::timeutil::format_duration;
 
+/// How one table ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TableStatus {
@@ -20,6 +21,7 @@ pub enum TableStatus {
     Incomplete,
 }
 
+/// The outcome of one table.
 #[derive(Debug, Clone, Serialize)]
 pub struct TableResult {
     pub table: String,
@@ -35,6 +37,7 @@ pub struct TableResult {
     pub status: TableStatus,
 }
 
+/// How the run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OverallStatus {
@@ -43,6 +46,7 @@ pub enum OverallStatus {
     Interrupted,
 }
 
+/// The outcome of a load: printed at the end, and written by `--report`.
 #[derive(Debug, Clone, Serialize)]
 pub struct Summary {
     pub database: String,
@@ -61,6 +65,7 @@ pub struct Summary {
 }
 
 impl Summary {
+    /// Per-table results from the live counters and the exact counts taken after the load.
     pub fn tables_from(stats: &Stats, finals: &[Option<u64>], interrupted: bool) -> Vec<TableResult> {
         stats
             .tables
@@ -91,6 +96,7 @@ impl Summary {
             .collect()
     }
 
+    /// The summary as a text table.
     pub fn render(&self) -> String {
         let mut s = String::new();
         let rule = "-".repeat(118);
@@ -100,8 +106,8 @@ impl Summary {
         let _ = writeln!(s, "Batch size: {}   Workers: {}\n", self.batch_size, self.workers);
         let _ = writeln!(
             s,
-            "{:<32} {:>13} {:>15} {:>13} {:>10} {:>9} {:>11} {:>7}  {}",
-            "Table", "Target Rows", "Inserted Rows", "Final Rows", "Repaired", "Duration", "Rows/s", "Retries", "Status"
+            "{:<32} {:>13} {:>15} {:>13} {:>10} {:>9} {:>11} {:>7}  Status",
+            "Table", "Target Rows", "Inserted Rows", "Final Rows", "Repaired", "Duration", "Rows/s", "Retries"
         );
         let _ = writeln!(s, "{rule}");
         for t in &self.tables {

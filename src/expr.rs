@@ -20,6 +20,7 @@ use crate::sql::convert::{data_type, TypeRules};
 use crate::timeutil::{civil_from_days, day_of, days_from_civil, US_PER_DAY, US_PER_HOUR, US_PER_MIN, US_PER_SEC};
 use crate::value::{date_of_time, parse_uuid, Num, Value};
 
+/// A comparison operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CmpOp {
     Eq,
@@ -54,6 +55,7 @@ impl CmpOp {
     }
 }
 
+/// An arithmetic operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArithOp {
     Add,
@@ -64,6 +66,7 @@ pub enum ArithOp {
     IntDiv,
 }
 
+/// The SQL functions the evaluator knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Func {
     IsNull,
@@ -116,6 +119,7 @@ pub enum Func {
     Has,
 }
 
+/// A compiled expression: columns are row indices, functions are resolved.
 #[derive(Debug, Clone)]
 pub enum CExpr {
     Lit(Value),
@@ -148,6 +152,8 @@ fn b(e: CExpr) -> Box<CExpr> {
 }
 
 impl Compiler<'_> {
+    /// Compiles a parsed expression; fails on columns, operators or functions the
+    /// evaluator does not know.
     pub fn compile(&self, e: &Expr) -> Result<CExpr, String> {
         Ok(match e {
             Expr::Identifier(id) => CExpr::Col((self.resolve)(&id.value).ok_or_else(|| format!("unknown column {}", id.value))?),
@@ -332,6 +338,19 @@ fn function(name: &str, mut args: Vec<CExpr>) -> Result<CExpr, String> {
             let first = it.next().unwrap();
             return Ok(it.fold(first, |acc, x| if and { CExpr::And(b(acc), b(x)) } else { CExpr::Or(b(acc), b(x)) }));
         }
+        // ClickHouse stores `CASE x WHEN v THEN r ... ELSE e END` as
+        // caseWithExpression(x, v, r, ..., e): compiled back to the CASE it was, so the
+        // solver analyses it the same way.
+        "casewithexpression" if n >= 4 && n % 2 == 0 => {
+            let otherwise = args.pop().map(b);
+            let mut rest = args.into_iter();
+            let operand = rest.next().map(b);
+            let mut whens = Vec::with_capacity((n - 2) / 2);
+            while let (Some(value), Some(result)) = (rest.next(), rest.next()) {
+                whens.push((value, result));
+            }
+            return Ok(CExpr::Case { operand, whens, otherwise });
+        }
         "tuple" => return Ok(CExpr::Tuple(args)),
         "array" => return Ok(CExpr::Array(args)),
         "isnull" if n == 1 => Func::IsNull,
@@ -393,6 +412,8 @@ pub struct EvalCtx {
     pub now_us: i64,
 }
 
+/// Evaluates `e` over `row` with SQL semantics: NULL propagates, and logic is
+/// three-valued.
 pub fn eval(e: &CExpr, row: &[Value], ctx: &EvalCtx) -> Value {
     match e {
         CExpr::Lit(v) => v.clone(),
@@ -815,6 +836,7 @@ pub fn cast(v: Value, t: &DataType) -> Value {
 // ---------------------------------------------------------------------------------------
 
 impl CExpr {
+    /// Adds the columns the expression reads to `out`.
     pub fn columns(&self, out: &mut BTreeSet<usize>) {
         self.walk(&mut |e| {
             if let CExpr::Col(i) = e {
@@ -823,6 +845,7 @@ impl CExpr {
         });
     }
 
+    /// Whether the expression reads column `col`.
     pub fn references(&self, col: usize) -> bool {
         let mut found = false;
         self.walk(&mut |e| found |= matches!(e, CExpr::Col(i) if *i == col));
@@ -1109,5 +1132,36 @@ mod tests {
         assert_eq!(row[2], Value::Decimal(250, 3));
         assert_eq!(compile("end_date IS NULL OR end_date > start_date").ordering(), Some((4, 5, true)));
         assert_eq!(compile("start_date <= end_date").ordering(), Some((4, 5, false)));
+    }
+}
+
+#[cfg(test)]
+mod clickhouse_function_tests {
+    use super::*;
+    use sqlparser::dialect::ClickHouseDialect;
+    use sqlparser::parser::Parser;
+
+    fn compile(sql: &str) -> CExpr {
+        let names = ["channel", "store_id"];
+        let resolve = |n: &str| names.iter().position(|c| *c == n);
+        let expr = Parser::new(&ClickHouseDialect {}).try_with_sql(sql).unwrap().parse_expr().unwrap();
+        Compiler { resolve: &resolve, rules: crate::sql::convert::TypeRules::STANDARD }.compile(&expr).unwrap()
+    }
+
+    /// ClickHouse stores `CASE x WHEN ...` as caseWithExpression: it must mean the same.
+    #[test]
+    fn case_with_expression_is_a_case() {
+        let stored = compile("caseWithExpression(channel, 'store', store_id IS NOT NULL, store_id IS NULL)");
+        let written = compile("CASE channel WHEN 'store' THEN store_id IS NOT NULL ELSE store_id IS NULL END");
+        assert!(matches!(stored, CExpr::Case { operand: Some(_), .. }));
+        let ctx = EvalCtx { now_us: 0 };
+        for row in [
+            vec![Value::Str("store".into()), Value::Int(1)],
+            vec![Value::Str("store".into()), Value::Null],
+            vec![Value::Str("web".into()), Value::Int(1)],
+            vec![Value::Str("web".into()), Value::Null],
+        ] {
+            assert_eq!(holds(&stored, &row, &ctx), holds(&written, &row, &ctx), "{row:?}");
+        }
     }
 }

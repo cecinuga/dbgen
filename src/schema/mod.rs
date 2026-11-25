@@ -11,14 +11,19 @@ use sqlparser::ast::Expr;
 
 use crate::dialect::Dialect;
 use crate::error::{Error, Result};
-use crate::sql::{self, AlterAction, ColumnPosition, ColumnSpec, Ddl, DefaultKind, EngineSpec, ExprSpec, Source, TableDef};
+use crate::sql::convert::{unwrap_nullable, wrap_nullable};
+use crate::sql::{AlterAction, ColumnPosition, ColumnSpec, Ddl, DefaultKind, EngineSpec, ExprSpec, ForeignKeySpec, Source, TableDef};
 
 pub use types::DataType;
 
+/// Every table the DDL input defines, in definition order.
 #[derive(Debug, Clone, Serialize)]
 pub struct Schema {
     pub dialect: Dialect,
     pub tables: Vec<Table>,
+    /// Named types (PostgreSQL enums and domains) that columns may use.
+    #[serde(skip)]
+    pub types: Vec<(String, DataType)>,
     /// Non-fatal observations made while compiling (unknown tables dropped, ...).
     pub warnings: Vec<String>,
     /// Every statement of the input, for `dbgen apply`.
@@ -28,12 +33,14 @@ pub struct Schema {
     pub ignored: Vec<(String, usize)>,
 }
 
+/// One statement of the DDL input and where it comes from.
 #[derive(Debug, Clone)]
 pub struct SourceStatement {
     pub at: String,
     pub sql: String,
 }
 
+/// A table as the DDL input leaves it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Table {
     pub name: String,
@@ -61,6 +68,7 @@ pub struct Table {
     pub defined_at: String,
 }
 
+/// A column of a [`Table`].
 #[derive(Debug, Clone, Serialize)]
 pub struct Column {
     pub name: String,
@@ -72,6 +80,7 @@ pub struct Column {
     pub fixed: Option<i64>,
 }
 
+/// How the database fills a column, and the SQL of its expression.
 #[derive(Debug, Clone, Serialize)]
 pub struct ColumnDefault {
     pub kind: DefaultKind,
@@ -80,6 +89,7 @@ pub struct ColumnDefault {
     pub expr: Option<Expr>,
 }
 
+/// A set of columns (or expressions) whose values must be unique across rows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Key {
     pub name: String,
@@ -87,6 +97,7 @@ pub struct Key {
     pub parts: Vec<KeyPart>,
 }
 
+/// Where a [`Key`] comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyKind {
@@ -96,6 +107,7 @@ pub enum KeyKind {
     SortingKey,
 }
 
+/// One part of a [`Key`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyPart {
@@ -104,13 +116,16 @@ pub enum KeyPart {
     Expr(String),
 }
 
+/// A declared reference to another table.
 #[derive(Debug, Clone, Serialize)]
 pub struct ForeignKey {
+    pub name: Option<String>,
     pub columns: Vec<String>,
     pub ref_table: String,
     pub ref_columns: Vec<String>,
 }
 
+/// A `CHECK` constraint: its name, SQL text and parsed expression.
 #[derive(Debug, Clone, Serialize)]
 pub struct Check {
     pub name: String,
@@ -135,12 +150,19 @@ fn ser_opt_expr<S: Serializer>(v: &Option<ExprSpec>, s: S) -> std::result::Resul
 }
 
 impl Table {
+    /// The column named `name`.
     pub fn column(&self, name: &str) -> Option<&Column> {
         self.columns.iter().find(|c| c.name == name)
     }
 
+    /// The position of the column named `name`.
     pub fn column_index(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|c| c.name == name)
+    }
+
+    fn column_mut(&mut self, name: &str) -> std::result::Result<&mut Column, String> {
+        let table = &self.name;
+        self.columns.iter_mut().find(|c| c.name == name).ok_or_else(|| format!("ALTER TABLE {table}: no column {name}"))
     }
 
     /// The primary key's columns, when it has one made only of columns.
@@ -162,16 +184,19 @@ impl Column {
         !matches!(self.default.as_ref().map(|d| d.kind), Some(DefaultKind::Materialized | DefaultKind::Alias))
     }
 
+    /// Whether the database fills the column when an INSERT leaves it out.
     pub fn has_default(&self) -> bool {
         matches!(self.default.as_ref().map(|d| d.kind), Some(DefaultKind::Default | DefaultKind::Identity))
     }
 }
 
 impl Schema {
+    /// The table named `name`.
     pub fn table(&self, name: &str) -> Option<&Table> {
         self.tables.iter().find(|t| t.name == name)
     }
 
+    /// The position of the table named `name`.
     pub fn table_index(&self, name: &str) -> Option<usize> {
         self.tables.iter().position(|t| t.name == name)
     }
@@ -220,12 +245,12 @@ pub fn read_sources(paths: &[PathBuf], base: &Path) -> Result<Vec<Source>> {
     Ok(out)
 }
 
-/// Compiles the DDL `sources` into a schema: every statement is parsed (by `sqlparser`
-/// through the dialect's adapter) and applied in order.
+/// Compiles the DDL `sources` into a schema: every statement is split and parsed by the
+/// dialect's connector (with `sqlparser`) and applied in order.
 pub fn compile(dialect: Dialect, sources: &[Source]) -> Result<Schema> {
-    let mut schema = Schema { dialect, tables: Vec::new(), warnings: Vec::new(), statements: Vec::new(), ignored: Vec::new() };
+    let mut schema = Schema { dialect, tables: Vec::new(), types: Vec::new(), warnings: Vec::new(), statements: Vec::new(), ignored: Vec::new() };
     for source in sources {
-        let statements = sql::split(source, dialect.sql()).map_err(|d| Error::Schema(d.to_string()))?;
+        let statements = dialect.split(source).map_err(|d| Error::Schema(d.to_string()))?;
         for stmt in &statements {
             let at = source.at(stmt.start());
             let ddl = dialect.parse_statement(stmt).map_err(|d| Error::Schema(d.to_string()))?;
@@ -242,7 +267,15 @@ impl Schema {
         match ddl {
             Ddl::CreateTable(def) => self.create(def, None, dialect),
             Ddl::CreateTableLike { def, source } => self.create(def, Some(source), dialect),
-            Ddl::AlterTable { table, actions } => {
+            Ddl::AlterTable { table, mut actions } => {
+                for action in &mut actions {
+                    if let AlterAction::AddColumn { column, .. } | AlterAction::ReplaceColumn { column, .. } = action {
+                        resolve_types(&mut column.ty, &self.types);
+                    }
+                    if let AlterAction::SetType { ty, .. } = action {
+                        resolve_types(ty, &self.types);
+                    }
+                }
                 let Some(t) = self.table_mut(&table) else {
                     if actions.iter().all(|a| matches!(a, AlterAction::Ignored(_))) {
                         return Ok(());
@@ -287,6 +320,24 @@ impl Schema {
                 self.tables[ib].name = a;
                 Ok(())
             }
+            Ddl::CreateType { name, ty } => {
+                self.types.retain(|(n, _)| !n.eq_ignore_ascii_case(&name));
+                self.types.push((name, ty));
+                Ok(())
+            }
+            Ddl::CreateUniqueIndex { table, name, columns } => {
+                match self.table_mut(&table) {
+                    Some(t) => t.keys.push(unique_key(name, columns)),
+                    None => self.warnings.push(format!("{at}: CREATE UNIQUE INDEX on {table}, which is not defined")),
+                }
+                Ok(())
+            }
+            Ddl::DropIndexes(names) => {
+                for t in &mut self.tables {
+                    t.keys.retain(|k| k.kind != KeyKind::Unique || !names.contains(&k.name));
+                }
+                Ok(())
+            }
             Ddl::Insert { table } => {
                 match self.table_mut(&table) {
                     Some(t) => t.seeded = true,
@@ -313,7 +364,10 @@ impl Schema {
         }
     }
 
-    fn create(&mut self, def: TableDef, like: Option<String>, dialect: Dialect) -> std::result::Result<(), String> {
+    fn create(&mut self, mut def: TableDef, like: Option<String>, dialect: Dialect) -> std::result::Result<(), String> {
+        for c in &mut def.columns {
+            resolve_types(&mut c.ty, &self.types);
+        }
         if let Some(existing) = self.table_index(&def.name) {
             if def.if_not_exists {
                 return Ok(());
@@ -368,12 +422,10 @@ impl Schema {
         if let Some(cols) = def.primary_key {
             table.keys.push(Key { name: "primary key".into(), kind: KeyKind::PrimaryKey, parts: cols.into_iter().map(KeyPart::Column).collect() });
         }
-        for cols in def.uniques {
-            table.keys.push(Key { name: format!("unique ({})", cols.join(", ")), kind: KeyKind::Unique, parts: cols.into_iter().map(KeyPart::Column).collect() });
+        for u in def.uniques {
+            table.keys.push(unique_key(u.name, u.columns));
         }
-        for fk in def.foreign_keys {
-            table.foreign_keys.push(ForeignKey { columns: fk.columns, ref_table: fk.ref_table, ref_columns: fk.ref_columns });
-        }
+        table.foreign_keys.extend(def.foreign_keys.into_iter().map(foreign_key));
         self.tables.push(table);
         Ok(())
     }
@@ -412,6 +464,32 @@ impl Schema {
                 }
             }
         }
+    }
+}
+
+fn unique_key(name: Option<String>, columns: Vec<String>) -> Key {
+    Key {
+        name: name.unwrap_or_else(|| format!("unique ({})", columns.join(", "))),
+        kind: KeyKind::Unique,
+        parts: columns.into_iter().map(KeyPart::Column).collect(),
+    }
+}
+
+fn foreign_key(fk: ForeignKeySpec) -> ForeignKey {
+    ForeignKey { name: fk.name, columns: fk.columns, ref_table: fk.ref_table, ref_columns: fk.ref_columns }
+}
+
+/// Replaces references to named types (`mood`, `public.mood`) with their definition.
+fn resolve_types(ty: &mut DataType, types: &[(String, DataType)]) {
+    match ty {
+        DataType::Nullable(t) | DataType::LowCardinality(t) | DataType::Array(t) => resolve_types(t, types),
+        DataType::Unsupported(name) => {
+            let bare = name.rsplit('.').next().unwrap_or(name).trim_matches('"');
+            if let Some((_, t)) = types.iter().find(|(n, _)| n.eq_ignore_ascii_case(bare)) {
+                *ty = t.clone();
+            }
+        }
+        _ => {}
     }
 }
 
@@ -468,6 +546,18 @@ fn alter(t: &mut Table, action: AlterAction, warnings: &mut Vec<String>) -> std:
             None if if_exists => {}
             None => return Err(format!("ALTER TABLE {table} MODIFY COLUMN {name}: no such column")),
         },
+        AlterAction::ReplaceColumn { name, column } => {
+            *t.column_mut(&name)? = column_from(column);
+        }
+        AlterAction::SetType { name, ty } => {
+            let c = t.column_mut(&name)?;
+            c.ty = if c.ty.is_nullable() { wrap_nullable(ty) } else { unwrap_nullable(ty) };
+        }
+        AlterAction::SetNullable { name, nullable } => {
+            let c = t.column_mut(&name)?;
+            let ty = std::mem::replace(&mut c.ty, DataType::Bool);
+            c.ty = if nullable { wrap_nullable(ty) } else { unwrap_nullable(ty) };
+        }
         AlterAction::RemoveColumnProperty { name, property } => {
             let i = find(t, &name).ok_or_else(|| format!("ALTER TABLE {table} MODIFY COLUMN {name}: no such column"))?;
             match property.as_str() {
@@ -513,19 +603,18 @@ fn alter(t: &mut Table, action: AlterAction, warnings: &mut Vec<String>) -> std:
             t.keys.retain(|k| k.kind != KeyKind::PrimaryKey);
             t.keys.push(Key { name: "primary key".into(), kind: KeyKind::PrimaryKey, parts: cols.into_iter().map(KeyPart::Column).collect() });
         }
-        AlterAction::AddUnique(cols) => {
-            t.keys.push(Key { name: format!("unique ({})", cols.join(", ")), kind: KeyKind::Unique, parts: cols.into_iter().map(KeyPart::Column).collect() });
-        }
-        AlterAction::AddForeignKey(fk) => {
-            t.foreign_keys.push(ForeignKey { columns: fk.columns, ref_table: fk.ref_table, ref_columns: fk.ref_columns });
-        }
+        AlterAction::AddUnique(u) => t.keys.push(unique_key(u.name, u.columns)),
+        AlterAction::AddForeignKey(fk) => t.foreign_keys.push(foreign_key(fk)),
         AlterAction::DropConstraint { name, if_exists } => {
-            let before = t.checks.len();
+            let before = t.checks.len() + t.keys.len() + t.foreign_keys.len();
             t.checks.retain(|c| c.name != name);
-            if t.checks.len() == before && !if_exists {
+            t.keys.retain(|k| k.name != name);
+            t.foreign_keys.retain(|fk| fk.name.as_deref() != Some(name.as_str()));
+            if t.checks.len() + t.keys.len() + t.foreign_keys.len() == before && !if_exists {
                 warnings.push(format!("table {table}: DROP CONSTRAINT {name}: no such constraint"));
             }
         }
+        AlterAction::DropPrimaryKey => t.keys.retain(|k| k.kind != KeyKind::PrimaryKey),
         AlterAction::ModifyOrderBy(exprs) => t.order_by = exprs,
         AlterAction::ModifyComment(c) => t.comment = Some(c),
         AlterAction::RenameTable(to) => return Ok(Some(to)),

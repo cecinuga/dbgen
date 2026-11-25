@@ -1,11 +1,53 @@
-# A throwaway ClickHouse for trying dbgen and for its integration tests.
+# Throwaway databases for trying dbgen and for its integration tests.
 #
-#   docker compose up -d        # ClickHouse 26.8, HTTP on localhost:18123, user dbgen / dbgen
+#   docker compose up -d                 # all of them
+#   docker compose up -d postgres        # just one
 #
-# Integration tests: DBGEN_TEST_CLICKHOUSE_URL=http://dbgen:dbgen@localhost:18123
+# | Service    | URL for dbgen                                       | Integration tests variable  |
+# |------------|-----------------------------------------------------|-----------------------------|
+# | postgres   | postgres://dbgen:dbgen@localhost:15432/DATABASE     | DBGEN_TEST_POSTGRES_URL     |
+# | mysql      | mysql://root:dbgen@localhost:13306/DATABASE         | DBGEN_TEST_MYSQL_URL        |
+# | clickhouse | http://dbgen:dbgen@localhost:18123/DATABASE         | DBGEN_TEST_CLICKHOUSE_URL   |
+#
+# The test variables take the URL without the database, e.g.
+# DBGEN_TEST_POSTGRES_URL=postgres://dbgen:dbgen@localhost:15432
 name: dbgen
 
 services:
+  postgres:
+    image: postgres:17
+    container_name: dbgen-postgres
+    environment:
+      POSTGRES_USER: dbgen
+      POSTGRES_PASSWORD: dbgen
+      POSTGRES_DB: dbgen
+    ports:
+      - "127.0.0.1:${DBGEN_PG_PORT:-15432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbgen"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.4
+    container_name: dbgen-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: dbgen
+    ports:
+      - "127.0.0.1:${DBGEN_MYSQL_PORT:-13306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -pdbgen --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
   clickhouse:
     image: clickhouse/clickhouse-server:26.8
     container_name: dbgen-clickhouse
@@ -29,4 +71,6 @@ services:
     restart: unless-stopped
 
 volumes:
+  postgres-data:
+  mysql-data:
   clickhouse-data:

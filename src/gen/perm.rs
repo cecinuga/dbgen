@@ -7,6 +7,7 @@
 
 use crate::rng::mix;
 
+/// A keyed permutation of `[0, n)`.
 #[derive(Debug, Clone)]
 pub struct Perm {
     n: u64,
@@ -16,6 +17,7 @@ pub struct Perm {
 }
 
 impl Perm {
+    /// The permutation of `[0, n)` selected by `key`.
     pub fn new(n: u64, key: u64) -> Perm {
         let bits = (64 - n.saturating_sub(1).leading_zeros()).max(2);
         let half = bits.div_ceil(2);
@@ -24,6 +26,7 @@ impl Perm {
         Perm { n, half, mask, keys }
     }
 
+    /// The size of the permuted range.
     pub fn len(&self) -> u64 {
         self.n
     }

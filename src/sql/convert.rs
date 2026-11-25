@@ -1,16 +1,19 @@
 //! Conversion from the `sqlparser` AST to dbgen's model: data types, column definitions,
 //! table constraints. The same SQL spelling can mean different things in different
 //! dialects (`Int8` is 8 bits in ClickHouse and 64 in PostgreSQL; columns are nullable by
-//! default in standard SQL and not in ClickHouse): [`TypeRules`] carries those choices.
+//! default in standard SQL and not in ClickHouse): [`TypeRules`] carries those choices,
+//! and each connector gives its own (`Connector::type_rules`), including the type names
+//! only it knows.
 
 use sqlparser::ast::{
     ArrayElemTypeDef, ColumnDef, ColumnOption, DataType as S, EnumMember, ExactNumberInfo, Expr, TableConstraint,
     TypeModifier, UnaryOperator, Value as SqlValue,
 };
 
-use super::{unqualified, CheckSpec, ColumnSpec, DefaultKind, DefaultSpec, ExprSpec, ForeignKeySpec, Statement};
+use super::{unqualified, CheckSpec, ColumnSpec, DefaultKind, DefaultSpec, ExprSpec, ForeignKeySpec, Statement, UniqueSpec};
 use crate::schema::DataType;
 
+/// How a dialect reads type spellings and column definitions.
 #[derive(Debug, Clone, Copy)]
 pub struct TypeRules {
     /// `Int8` is an 8-bit integer (ClickHouse) rather than PostgreSQL's 64-bit `int8`.
@@ -25,8 +28,38 @@ pub struct TypeRules {
     pub date_is_16_bit: bool,
     /// `TIMESTAMP` / `DATETIME` without precision is 32-bit seconds (ClickHouse).
     pub timestamp_is_seconds: bool,
+    /// Fractional digits of `TIMESTAMP` / `DATETIME` without precision, when it is not
+    /// 32-bit seconds: 6 in PostgreSQL, 0 in MySQL.
+    pub timestamp_precision: u8,
+    /// The type of a name `sqlparser` does not know and leaves as custom (`serial`,
+    /// `IPv4`), with its modifiers; `None` makes the type unsupported.
+    pub custom_type: fn(name: &str, modifiers: &[TypeModifier], rules: &TypeRules) -> Option<DataType>,
+    /// Custom type names, lowercase, that also make the column `NOT NULL` with an identity
+    /// default (PostgreSQL `serial`).
+    pub identity_types: &'static [&'static str],
 }
 
+impl TypeRules {
+    /// Standard SQL: columns are nullable unless declared `NOT NULL`, lengths are limits,
+    /// timestamps have microseconds, no custom type names.
+    pub const STANDARD: TypeRules = TypeRules {
+        int8_is_8_bits: false,
+        nullable_by_default: true,
+        varchar_has_length: true,
+        date_is_16_bit: false,
+        timestamp_is_seconds: false,
+        timestamp_precision: 6,
+        custom_type: no_custom_type,
+        identity_types: &[],
+    };
+}
+
+/// Knows no custom type names: [`TypeRules::custom_type`] of [`TypeRules::STANDARD`].
+pub fn no_custom_type(_name: &str, _modifiers: &[TypeModifier], _rules: &TypeRules) -> Option<DataType> {
+    None
+}
+
+/// Converts a parsed SQL type.
 pub fn data_type(t: &S, rules: &TypeRules) -> DataType {
     let int = |bits: u16, signed: bool| DataType::Int { bits, signed };
     let string = |len: Option<u64>| DataType::String {
@@ -84,10 +117,15 @@ pub fn data_type(t: &S, rules: &TypeRules) -> DataType {
         S::Date if rules.date_is_16_bit => DataType::Date,
         S::Date | S::Date32 => DataType::Date32,
         S::Datetime(None) | S::Timestamp(None, _) if rules.timestamp_is_seconds => DataType::DateTime { precision: None, tz: None },
-        S::Datetime(p) | S::Timestamp(p, _) | S::TimestampNtz(p) => DataType::DateTime { precision: Some(p.unwrap_or(6).min(9) as u8), tz: None },
+        S::Datetime(p) | S::Timestamp(p, _) | S::TimestampNtz(p) => {
+            DataType::DateTime { precision: Some(p.map_or(rules.timestamp_precision, |p| p.min(9) as u8)), tz: None }
+        }
         S::Datetime64(p, tz) => DataType::DateTime { precision: Some((*p).min(9) as u8), tz: tz.clone() },
         S::JSON | S::JSONB => DataType::Json,
         S::Enum(members, bits) => enum_type(members, *bits),
+        S::Set(values) => enum_type(&values.iter().cloned().map(EnumMember::Name).collect::<Vec<_>>(), None),
+        // SQLite accepts columns without a type; they store text best.
+        S::Unspecified => DataType::String { max_len: None },
         S::Array(elem) => match elem {
             ArrayElemTypeDef::AngleBracket(t)
             | ArrayElemTypeDef::SquareBracket(t, _)
@@ -101,7 +139,7 @@ pub fn data_type(t: &S, rules: &TypeRules) -> DataType {
         S::Nested(cols) => DataType::Array(Box::new(DataType::Tuple(
             cols.iter().map(|c| (Some(c.name.value.clone()), data_type(&c.data_type, rules))).collect(),
         ))),
-        S::Custom(name, mods) => custom_type(&unqualified(name), mods, rules).unwrap_or_else(|| DataType::Unsupported(t.to_string())),
+        S::Custom(name, mods) => (rules.custom_type)(&unqualified(name), mods, rules).unwrap_or_else(|| DataType::Unsupported(t.to_string())),
         other => DataType::Unsupported(other.to_string()),
     }
 }
@@ -137,7 +175,38 @@ pub fn int_literal(e: &Expr) -> Option<i64> {
     }
 }
 
-fn custom_type(name: &str, mods: &[TypeModifier], rules: &TypeRules) -> Option<DataType> {
+/// Whether a type is one of the dialect's identity types (PostgreSQL `serial`), whose
+/// column gets a sequence default.
+fn is_identity_type(t: &S, rules: &TypeRules) -> bool {
+    matches!(t, S::Custom(name, _) if rules.identity_types.contains(&unqualified(name).to_ascii_lowercase().as_str()))
+}
+
+/// Legacy: the identity type names every dialect accepted before connectors (PostgreSQL
+/// `serial` and its variants). Kept for MySQL (which has its own `SERIAL`) and SQLite
+/// (which accepts any type name), so their DDL compiles as it always did.
+pub const COMPAT_IDENTITY_TYPES: &[&str] = &["smallserial", "serial2", "serial", "serial4", "bigserial", "serial8"];
+
+/// Legacy: the custom type names every dialect accepted before connectors, the PostgreSQL
+/// names (`serial`, `inet`, `citext`, `money`, `timestamptz`...) and the ClickHouse ones
+/// (`IPv4`, `Decimal32(S)`, `Point`, `SimpleAggregateFunction`...). Kept for MySQL and
+/// SQLite, so their DDL compiles as it always did; a new connector writes its own
+/// [`TypeRules::custom_type`] with the names of its database only.
+pub fn compat_custom_type(name: &str, mods: &[TypeModifier], rules: &TypeRules) -> Option<DataType> {
+    let int = |bits: u16| DataType::Int { bits, signed: true };
+    Some(match name.to_ascii_lowercase().as_str() {
+        // PostgreSQL: serial types are integers whose default is a sequence.
+        "smallserial" | "serial2" => int(16),
+        "serial" | "serial4" => int(32),
+        "bigserial" | "serial8" => int(64),
+        "inet" | "cidr" => DataType::Ipv4,
+        "citext" | "name" => DataType::String { max_len: None },
+        "money" => DataType::Decimal { precision: 19, scale: 2 },
+        "timestamptz" => DataType::DateTime { precision: Some(rules.timestamp_precision), tz: Some("UTC".into()) },
+        _ => return compat_clickhouse_type(name, mods, rules),
+    })
+}
+
+fn compat_clickhouse_type(name: &str, mods: &[TypeModifier], rules: &TypeRules) -> Option<DataType> {
     let number = |i: usize| match mods.get(i) {
         Some(TypeModifier::Number(n, _)) => n.parse::<u8>().ok(),
         _ => None,
@@ -159,7 +228,10 @@ fn custom_type(name: &str, mods: &[TypeModifier], rules: &TypeRules) -> Option<D
         "MultiPolygon" => DataType::Array(Box::new(polygon())),
         // SimpleAggregateFunction(f, T) stores plain T values.
         "SimpleAggregateFunction" => match mods.get(1) {
-            Some(TypeModifier::Identifier(id)) => crate::dialect::parse_type_name(&id.value, rules)?,
+            Some(TypeModifier::Identifier(id)) => {
+                let mut parser = sqlparser::parser::Parser::new(&sqlparser::dialect::ClickHouseDialect {}).try_with_sql(&id.value).ok()?;
+                data_type(&parser.parse_data_type().ok()?, rules)
+            }
             _ => return None,
         },
         _ => return None,
@@ -192,11 +264,12 @@ pub fn column(stmt: &Statement, def: ColumnDef, rules: &TypeRules) -> Vec<Column
             .collect();
     }
     let mut ty = data_type(&def.data_type, rules);
-    let mut nullable: Option<bool> = None;
+    let serial = is_identity_type(&def.data_type, rules);
+    let mut nullable: Option<bool> = serial.then_some(false);
     let mut spec = ColumnSpec {
         name,
         ty: DataType::Bool,
-        default: None,
+        default: serial.then_some(DefaultSpec { kind: DefaultKind::Identity, expr: None }),
         comment: None,
         primary_key: false,
         unique: false,
@@ -231,6 +304,7 @@ pub fn column(stmt: &Statement, def: ColumnDef, rules: &TypeRules) -> Vec<Column
             ColumnOption::Unique(_) => spec.unique = true,
             ColumnOption::ForeignKey(fk) => {
                 spec.references = Some(ForeignKeySpec {
+                    name: fk.name.map(|n| n.value),
                     columns: vec![spec.name.clone()],
                     ref_table: unqualified(&fk.foreign_table),
                     ref_columns: fk.referred_columns.iter().map(|c| c.value.clone()).collect(),
@@ -265,6 +339,7 @@ pub fn wrap_nullable(t: DataType) -> DataType {
     }
 }
 
+/// Removes `Nullable`, also from inside `LowCardinality`.
 pub fn unwrap_nullable(t: DataType) -> DataType {
     match t {
         DataType::LowCardinality(inner) => DataType::LowCardinality(Box::new(unwrap_nullable(*inner))),
@@ -273,15 +348,17 @@ pub fn unwrap_nullable(t: DataType) -> DataType {
     }
 }
 
-/// Converts a standard-SQL table constraint.
+/// A table constraint, as far as generation is concerned.
 pub enum Constraint {
-    Check(CheckSpec),
+    Check(Box<CheckSpec>),
     PrimaryKey(Vec<String>),
-    Unique(Vec<String>),
+    Unique(UniqueSpec),
     ForeignKey(ForeignKeySpec),
+    /// Constraints that do not restrict values (indexes, exclusions...).
     Other,
 }
 
+/// Converts a standard-SQL table constraint.
 pub fn table_constraint(stmt: &Statement, c: TableConstraint) -> Constraint {
     let cols = |cols: &[sqlparser::ast::IndexColumn]| -> Vec<String> {
         cols.iter()
@@ -292,10 +369,15 @@ pub fn table_constraint(stmt: &Statement, c: TableConstraint) -> Constraint {
             .collect()
     };
     match c {
-        TableConstraint::Check(c) => Constraint::Check(CheckSpec { name: c.name.map(|n| n.value), expr: expr_spec(stmt, *c.expr) }),
+        TableConstraint::Check(c) => Constraint::Check(Box::new(CheckSpec { name: c.name.map(|n| n.value), expr: expr_spec(stmt, *c.expr) })),
         TableConstraint::PrimaryKey(pk) => Constraint::PrimaryKey(cols(&pk.columns)),
-        TableConstraint::Unique(u) => Constraint::Unique(cols(&u.columns)),
+        TableConstraint::Unique(u) => {
+            // MySQL names the index rather than the constraint: `UNIQUE KEY name (...)`.
+            let name = u.name.or(u.index_name).map(|n| n.value);
+            Constraint::Unique(UniqueSpec { name, columns: cols(&u.columns) })
+        }
         TableConstraint::ForeignKey(fk) => Constraint::ForeignKey(ForeignKeySpec {
+            name: fk.name.map(|n| n.value),
             columns: fk.columns.iter().map(|c| c.value.clone()).collect(),
             ref_table: unqualified(&fk.foreign_table),
             ref_columns: fk.referred_columns.iter().map(|c| c.value.clone()).collect(),

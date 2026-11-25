@@ -15,7 +15,7 @@ use std::ops::Range;
 use sqlparser::ast::{Expr, ObjectName, ObjectNamePart};
 use sqlparser::dialect::Dialect as SqlDialect;
 use sqlparser::parser::{Parser, ParserError};
-use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer, Whitespace};
+use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
 
 use crate::schema::DataType;
 
@@ -27,6 +27,7 @@ pub struct Source {
 }
 
 impl Source {
+    /// A source named `name` (a file path, for messages).
     pub fn new(name: impl Into<String>, text: String) -> Source {
         let mut line_starts = vec![0];
         line_starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
@@ -46,6 +47,7 @@ impl Source {
         start + line.char_indices().nth(chars).map_or(line.len(), |(i, _)| i)
     }
 
+    /// `file:line:column` of a location, for messages.
     pub fn at(&self, loc: Location) -> String {
         format!("{}:{}:{}", self.name, loc.line, loc.column)
     }
@@ -73,14 +75,17 @@ pub struct Statement<'s> {
 }
 
 impl<'s> Statement<'s> {
+    /// The statement's source text.
     pub fn text(&self) -> &'s str {
         &self.source.text[self.range.clone()]
     }
 
+    /// Where the statement starts.
     pub fn start(&self) -> Location {
         self.toks.first().map_or(Location { line: 0, column: 0 }, |t| t.span.start)
     }
 
+    /// A diagnostic at `at`.
     pub fn diag(&self, at: Location, message: impl Into<String>) -> Diag {
         Diag { at: self.source.at(at), message: message.into() }
     }
@@ -105,6 +110,7 @@ impl<'s> Statement<'s> {
 }
 
 /// Tokenizes `source` with `dialect` and splits it into statements at top-level `;`.
+/// The `;` inside the `BEGIN ... END` body of a `CREATE TRIGGER` do not split.
 pub fn split<'s>(source: &'s Source, dialect: &dyn SqlDialect) -> Result<Vec<Statement<'s>>, Diag> {
     let tokens = Tokenizer::new(dialect, &source.text).tokenize_with_location().map_err(|e| Diag {
         at: source.at(e.location),
@@ -126,7 +132,7 @@ pub fn split<'s>(source: &'s Source, dialect: &dyn SqlDialect) -> Result<Vec<Sta
         match &t.token {
             Token::Whitespace(_) => continue,
             Token::EOF => break,
-            Token::SemiColon if depth <= 0 => {
+            Token::SemiColon if depth <= 0 && !inside_trigger_body(&current) => {
                 flush(&mut current, &mut out);
                 depth = 0;
                 continue;
@@ -139,6 +145,33 @@ pub fn split<'s>(source: &'s Source, dialect: &dyn SqlDialect) -> Result<Vec<Sta
     }
     flush(&mut current, &mut out);
     Ok(out)
+}
+
+/// Whether `toks`, the start of a statement, is a `CREATE TRIGGER` whose `BEGIN` block is
+/// still open. `CASE ... END` inside the body is balanced too.
+fn inside_trigger_body(toks: &[TokenWithSpan]) -> bool {
+    let mut i = usize::from(is_kw(toks.first(), "CREATE"));
+    if i == 0 {
+        return false;
+    }
+    if are_kws(toks, i, &["OR", "REPLACE"]) {
+        i += 2;
+    }
+    if is_kw(toks.get(i), "TEMP") || is_kw(toks.get(i), "TEMPORARY") {
+        i += 1;
+    }
+    if !is_kw(toks.get(i), "TRIGGER") {
+        return false;
+    }
+    let mut open = 0i32;
+    for t in &toks[i..] {
+        if is_kw(Some(t), "BEGIN") || is_kw(Some(t), "CASE") {
+            open += 1;
+        } else if is_kw(Some(t), "END") {
+            open -= 1;
+        }
+    }
+    open > 0
 }
 
 // ---------------------------------------------------------------------------------------
@@ -163,6 +196,7 @@ pub fn word(t: Option<&TokenWithSpan>) -> Option<String> {
     }
 }
 
+/// The string literal at `t`.
 pub fn string_lit(t: Option<&TokenWithSpan>) -> Option<String> {
     match t.map(|t| &t.token) {
         Some(Token::SingleQuotedString(s) | Token::DoubleQuotedString(s)) => Some(s.clone()),
@@ -302,23 +336,27 @@ pub fn read_name(toks: &[TokenWithSpan], mut i: usize) -> Option<(String, usize)
     Some((name, i))
 }
 
-pub fn is_comment(t: &Token) -> bool {
-    matches!(t, Token::Whitespace(Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_)))
-}
-
 // ---------------------------------------------------------------------------------------
 // Dialect-neutral DDL commands.
 // ---------------------------------------------------------------------------------------
 
+/// One statement of the DDL input, reduced to its effect on the schema.
 #[derive(Debug, Clone)]
 pub enum Ddl {
     CreateTable(TableDef),
-    /// `CREATE TABLE name AS source ...`: the structure of `source`, with `def`'s clauses.
+    /// `CREATE TABLE name AS source ...` or `... LIKE source`: the structure of `source`,
+    /// with `def`'s clauses.
     CreateTableLike { def: TableDef, source: String },
     AlterTable { table: String, actions: Vec<AlterAction> },
     DropTables { names: Vec<String>, if_exists: bool },
     RenameTables(Vec<(String, String)>),
     ExchangeTables(String, String),
+    /// A named type usable in later column definitions: a PostgreSQL enum or domain.
+    CreateType { name: String, ty: DataType },
+    /// `CREATE UNIQUE INDEX`: a uniqueness constraint under another name.
+    CreateUniqueIndex { table: String, name: Option<String>, columns: Vec<String> },
+    /// `DROP INDEX`: removes the unique keys created under these names, if any.
+    DropIndexes(Vec<String>),
     /// Data written by the DDL input itself (seed rows).
     Insert { table: String },
     /// A view that writes into `target` whenever its source table receives rows.
@@ -327,6 +365,7 @@ pub enum Ddl {
     Ignored(String),
 }
 
+/// A `CREATE TABLE` statement.
 #[derive(Debug, Clone, Default)]
 pub struct TableDef {
     pub name: String,
@@ -335,7 +374,7 @@ pub struct TableDef {
     pub columns: Vec<ColumnSpec>,
     pub checks: Vec<CheckSpec>,
     pub primary_key: Option<Vec<String>>,
-    pub uniques: Vec<Vec<String>>,
+    pub uniques: Vec<UniqueSpec>,
     pub foreign_keys: Vec<ForeignKeySpec>,
     pub engine: Option<EngineSpec>,
     pub order_by: Vec<ExprSpec>,
@@ -345,6 +384,38 @@ pub struct TableDef {
     pub at: String,
 }
 
+impl TableDef {
+    /// Adds a column, moving its inline constraints (`PRIMARY KEY`, `UNIQUE`,
+    /// `REFERENCES`, `CHECK`) to the table.
+    pub fn add_column(&mut self, mut c: ColumnSpec) {
+        if let Some(check) = c.check.take() {
+            self.checks.push(check);
+        }
+        if let Some(fk) = c.references.take() {
+            self.foreign_keys.push(fk);
+        }
+        if c.primary_key {
+            self.primary_key = Some(vec![c.name.clone()]);
+        }
+        if c.unique {
+            self.uniques.push(UniqueSpec { name: None, columns: vec![c.name.clone()] });
+        }
+        self.columns.push(c);
+    }
+
+    /// Adds a table constraint.
+    pub fn add_constraint(&mut self, c: convert::Constraint) {
+        match c {
+            convert::Constraint::Check(c) => self.checks.push(*c),
+            convert::Constraint::PrimaryKey(cols) => self.primary_key = Some(cols),
+            convert::Constraint::Unique(u) => self.uniques.push(u),
+            convert::Constraint::ForeignKey(fk) => self.foreign_keys.push(fk),
+            convert::Constraint::Other => {}
+        }
+    }
+}
+
+/// A column definition, with the constraints written on it.
 #[derive(Debug, Clone)]
 pub struct ColumnSpec {
     pub name: String,
@@ -357,6 +428,7 @@ pub struct ColumnSpec {
     pub check: Option<CheckSpec>,
 }
 
+/// How the database fills a column when an `INSERT` does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DefaultKind {
@@ -372,6 +444,7 @@ pub enum DefaultKind {
     Identity,
 }
 
+/// A column default and its expression, when it has one.
 #[derive(Debug, Clone)]
 pub struct DefaultSpec {
     pub kind: DefaultKind,
@@ -385,47 +458,68 @@ pub struct ExprSpec {
     pub sql: String,
 }
 
+/// A `CHECK` constraint.
 #[derive(Debug, Clone)]
 pub struct CheckSpec {
     pub name: Option<String>,
     pub expr: ExprSpec,
 }
 
+/// A `UNIQUE` constraint.
+#[derive(Debug, Clone)]
+pub struct UniqueSpec {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+}
+
+/// A `FOREIGN KEY` constraint.
 #[derive(Debug, Clone)]
 pub struct ForeignKeySpec {
+    pub name: Option<String>,
     pub columns: Vec<String>,
     pub ref_table: String,
     /// Empty: the referenced table's primary key.
     pub ref_columns: Vec<String>,
 }
 
+/// A ClickHouse table engine and its arguments.
 #[derive(Debug, Clone)]
 pub struct EngineSpec {
     pub name: String,
     pub args: Vec<ExprSpec>,
 }
 
+/// One change of an `ALTER TABLE` statement.
 #[derive(Debug, Clone)]
 pub enum AlterAction {
     AddColumn { column: ColumnSpec, if_not_exists: bool, after: Option<ColumnPosition> },
     DropColumn { name: String, if_exists: bool },
     /// Changes what is given, keeps the rest. `ty` None: the type is unchanged.
     ModifyColumn { name: String, if_exists: bool, ty: Option<DataType>, default: Option<DefaultSpec>, comment: Option<String> },
+    /// Replaces the whole definition of column `name` (MySQL `MODIFY`/`CHANGE COLUMN`).
+    ReplaceColumn { name: String, column: ColumnSpec },
+    /// Changes the type and keeps the column's nullability (`ALTER COLUMN ... TYPE`).
+    SetType { name: String, ty: DataType },
+    /// `SET NOT NULL` (false) or `DROP NOT NULL` (true).
+    SetNullable { name: String, nullable: bool },
     /// `REMOVE DEFAULT|MATERIALIZED|ALIAS|COMMENT...`: drops that property.
     RemoveColumnProperty { name: String, property: String },
     RenameColumn { from: String, to: String, if_exists: bool },
     CommentColumn { name: String, comment: String },
     AddCheck(CheckSpec),
     AddPrimaryKey(Vec<String>),
-    AddUnique(Vec<String>),
+    AddUnique(UniqueSpec),
     AddForeignKey(ForeignKeySpec),
+    /// Drops the check, key or foreign key of that name.
     DropConstraint { name: String, if_exists: bool },
+    DropPrimaryKey,
     ModifyOrderBy(Vec<ExprSpec>),
     ModifyComment(String),
     RenameTable(String),
     Ignored(String),
 }
 
+/// Where `ADD COLUMN` puts the new column.
 #[derive(Debug, Clone)]
 pub enum ColumnPosition {
     First,

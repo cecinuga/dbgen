@@ -1,4 +1,8 @@
-//! The commands: inspect, validate, apply, generate, verify.
+//! The commands: inspect, init, validate, apply, generate, verify.
+//!
+//! Each takes a resolved [`Config`] (file and command-line flags merged). The schema comes
+//! from the configured DDL files, or, when there are none, from the database itself
+//! ([`Backend::introspect_ddl`](crate::db::Backend::introspect_ddl)).
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -7,57 +11,146 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::db::Database;
-use crate::dialect::Dialect;
 use crate::engine::{self, Load, Stats};
 use crate::error::{Error, Result};
 use crate::plan::{self, Plan};
 use crate::progress::Progress;
 use crate::report::{OverallStatus, Summary};
 use crate::schema::{self, KeyPart, Schema};
+use crate::sql::Source;
 use crate::state::{self, State};
 use crate::timeutil::Rfc3339;
 use crate::verify;
 
+/// The schema of the configuration: compiled from its DDL files, or read from the
+/// database when it has none. Logs the schema's warnings.
 pub fn load_schema(config: &Config) -> Result<Schema> {
     if config.schema.is_empty() {
-        return Err(Error::Config(format!("{}: 'schema' lists no DDL files or directories", config.path.display())));
+        let db = Database::connect(config)?;
+        return schema_from_database(config, &db);
     }
+    schema_from_files(config)
+}
+
+/// Like [`load_schema`], reusing a connected database when the schema is read from it.
+fn load_schema_with(config: &Config, db: &Database) -> Result<Schema> {
+    if config.schema.is_empty() {
+        schema_from_database(config, db)
+    } else {
+        schema_from_files(config)
+    }
+}
+
+fn schema_from_files(config: &Config) -> Result<Schema> {
     let sources = schema::read_sources(&config.schema, &config.base_dir)?;
     let schema = schema::compile(config.dialect, &sources)?;
-    for w in &schema.warnings {
-        tracing::warn!("{w}");
-    }
+    log_warnings(&schema);
     Ok(schema)
 }
 
-/// `dbgen inspect`: the compiled schema, and the plan when a configuration is given.
-pub fn inspect(config_path: Option<&Path>, files: &[PathBuf], dialect: Option<Dialect>, json: bool) -> Result<()> {
-    let (schema, config) = match config_path {
-        Some(p) if files.is_empty() => {
-            let config = Config::load(p)?;
-            (load_schema(&config)?, Some(config))
-        }
-        _ => {
-            if files.is_empty() {
-                return Err(Error::Config("give DDL files or directories, or --config".into()));
-            }
-            let sources = schema::read_sources(files, Path::new("."))?;
-            (schema::compile(dialect.unwrap_or(Dialect::Clickhouse), &sources)?, None)
-        }
-    };
+/// Asks the database for its DDL and compiles it as if it were a file.
+fn schema_from_database(config: &Config, db: &Database) -> Result<Schema> {
+    let at = format!("connecting to {}", db.describe());
+    db.version().map_err(|e| e.into_error(&at))?;
+    let ddl = db.introspect_ddl().map_err(|e| e.into_error("reading the schema from the database"))?;
+    let schema = schema::compile(config.dialect, &[Source::new(format!("<{}>", db.describe()), ddl)])?;
+    tracing::info!(tables = schema.tables.len(), "schema read from the database");
+    log_warnings(&schema);
+    Ok(schema)
+}
+
+fn log_warnings(schema: &Schema) {
+    for w in &schema.warnings {
+        tracing::warn!("{w}");
+    }
+}
+
+/// `dbgen inspect`: the schema, and the plan when there are row targets. Needs the
+/// database only when the schema is read from it.
+pub fn inspect(config: &Config, json: bool) -> Result<()> {
+    let schema = load_schema(config)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&schema).expect("serializable"));
         return Ok(());
     }
     println!("{}", render_schema(&schema));
-    if let Some(config) = config {
-        let plan = plan::build(&config, &schema, None)?;
+    if !config.tables.is_empty() || config.generation.default_rows.is_some() {
+        let plan = plan::build(config, &schema, None)?;
         println!("{}", plan.render(&schema));
         println!("(Without a database: rows of tables that are referenced but not generated are not read. `dbgen validate` reads them.)");
     }
     Ok(())
 }
 
+/// `dbgen init`: a starting configuration for the schema, every table listed with
+/// `rows` rows (tables the DDL seeds, or that only views write, as `existing`). The
+/// password of the database URL is replaced by `${DBGEN_PASSWORD}`.
+pub fn init(config: &Config, rows: u64) -> Result<String> {
+    let schema = load_schema(config)?;
+    let mut s = String::new();
+    let source = if config.schema.is_empty() { "the database" } else { "the DDL files" };
+    let _ = writeln!(s, "# Starting configuration written by `dbgen init` from {source}.");
+    let _ = writeln!(s, "# Adjust the row counts, then run `dbgen validate -c <this file>`.");
+    match &config.database {
+        Some(url) => {
+            let (url, masked) = mask_password(url);
+            if masked {
+                let _ = writeln!(s, "# The password is read from the environment: export DBGEN_PASSWORD=...");
+            }
+            let _ = writeln!(s, "database: {}", yaml_quote(&url));
+        }
+        None => {
+            let _ = writeln!(s, "dialect: {}", config.dialect.name());
+        }
+    }
+    if !config.schema.is_empty() {
+        let paths: Vec<String> = config.schema.iter().map(|p| yaml_quote(&p.display().to_string())).collect();
+        let _ = writeln!(s, "schema: [{}]", paths.join(", "));
+    }
+    let g = &config.generation;
+    let _ = writeln!(s, "\ngeneration:\n  seed: {}\n  history_days: {}", g.seed, g.history_days);
+    let _ = writeln!(s, "  end_time: \"{}\"", g.end_time.clone().unwrap_or_else(|| crate::timeutil::Ymd(crate::timeutil::day_of(crate::timeutil::today_utc_midnight())).to_string()));
+    let _ = writeln!(s, "\ntables:");
+    for t in &schema.tables {
+        let (value, note) = match () {
+            _ if !t.storage => ("skip".to_string(), " # stores no rows".to_string()),
+            _ if t.seeded => ("existing".to_string(), " # seeded by the DDL".to_string()),
+            _ => match &t.derived_by {
+                Some(view) => ("existing".to_string(), format!(" # written by {view}")),
+                None => (rows.to_string(), String::new()),
+            },
+        };
+        let _ = writeln!(s, "  {}: {value}{note}", yaml_key(&t.name));
+    }
+    Ok(s)
+}
+
+/// The URL with its password replaced by `${DBGEN_PASSWORD}`, and whether it had one.
+fn mask_password(url: &str) -> (String, bool) {
+    let Some((scheme, rest)) = url.split_once("://") else { return (url.to_string(), false) };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let Some(at) = rest[..authority_end].rfind('@') else { return (url.to_string(), false) };
+    match rest[..at].split_once(':') {
+        Some((user, password)) if !password.is_empty() && !password.starts_with("${") => {
+            (format!("{scheme}://{user}:${{DBGEN_PASSWORD}}{}", &rest[at..]), true)
+        }
+        _ => (url.to_string(), false),
+    }
+}
+
+fn yaml_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn yaml_key(s: &str) -> String {
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        s.to_string()
+    } else {
+        yaml_quote(s)
+    }
+}
+
+/// The compiled schema as text, for `dbgen inspect`.
 pub fn render_schema(schema: &Schema) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "Schema ({}): {} tables from {} statements", schema.dialect.name(), schema.tables.len(), schema.statements.len());
@@ -112,15 +205,16 @@ pub fn render_schema(schema: &Schema) -> String {
     s
 }
 
-/// Compares the compiled schema with the live database.
+/// Compares the compiled schema with the live database: generated and read tables must
+/// exist with every DDL column. Column types must match exactly only when the backend's
+/// bulk format depends on them.
 fn check_live(db: &Database, schema: &Schema, plan: &Plan) -> Result<()> {
-    let live = db.live_columns()?;
+    let live = db.live_columns().map_err(|e| e.into_error("reading the catalog"))?;
     let mut problems = Vec::new();
     for (ti, tp) in plan.tables.iter().enumerate() {
         let t = &schema.tables[ti];
         let generated = matches!(tp.mode, plan::Mode::Generate(_));
-        let read = plan.world.existing[ti].is_some();
-        if !generated && !read {
+        if !generated && plan.world.existing[ti].is_none() {
             continue;
         }
         let Some(cols) = live.get(&t.name) else {
@@ -133,10 +227,10 @@ fn check_live(db: &Database, schema: &Schema, plan: &Plan) -> Result<()> {
         for c in &t.columns {
             match cols.iter().find(|(n, _)| *n == c.name) {
                 None => problems.push(format!("column {}.{} is in the DDL but not in the database", t.name, c.name)),
-                Some((_, ty)) => match db.parse_type(ty) {
-                    Ok(live_ty) if live_ty == c.ty => {}
-                    Ok(_) | Err(_) => problems.push(format!("column {}.{} is {} in the DDL but {ty} in the database", t.name, c.name, c.ty)),
-                },
+                Some((_, ty)) if db.strict_types() && db.parse_type(ty).as_ref() != Ok(&c.ty) => {
+                    problems.push(format!("column {}.{} is {} in the DDL but {ty} in the database", t.name, c.name, c.ty));
+                }
+                Some(_) => {}
             }
         }
         for (name, ty) in cols {
@@ -148,21 +242,21 @@ fn check_live(db: &Database, schema: &Schema, plan: &Plan) -> Result<()> {
     if problems.is_empty() {
         Ok(())
     } else {
-        Err(Error::Validation(format!(
-            "the database does not match the DDL input:\n{}",
-            problems.iter().map(|p| format!("  - {p}")).collect::<Vec<_>>().join("\n")
-        )))
+        Err(Error::Validation(format!("the database does not match the DDL input:\n{}", bullets(&problems))))
     }
 }
 
-/// The server version; the first call, so a missing database gets a useful hint.
-fn server_version(db: &Database) -> Result<String> {
-    db.version().map_err(|e| match e {
-        Error::Db(m) if m.contains("UNKNOWN_DATABASE") => Error::Db(format!("{m}\n`dbgen apply --create-database` creates it and applies the DDL")),
-        other => other,
-    })
+fn bullets(items: &[String]) -> String {
+    items.iter().map(|p| format!("  - {p}")).collect::<Vec<_>>().join("\n")
 }
 
+/// The server version. The first call to reach the server, so its error says whether the
+/// server or the database is missing.
+fn server_version(db: &Database) -> Result<String> {
+    db.version().map_err(|e| e.into_error(&format!("connecting to {}", db.describe())))
+}
+
+/// Everything a command needs once the configuration, the DDL and the database agree.
 struct Prepared {
     config: Config,
     schema: Schema,
@@ -171,12 +265,11 @@ struct Prepared {
     server_version: String,
 }
 
-fn prepare(config_path: &Path) -> Result<Prepared> {
-    let config = Config::load(config_path)?;
-    let schema = load_schema(&config)?;
+fn prepare(config: Config) -> Result<Prepared> {
     let db = Database::connect(&config)?;
     tracing::info!(target = %db.describe(), "connecting");
     let server_version = server_version(&db)?;
+    let schema = load_schema_with(&config, &db)?;
     let plan = plan::build(&config, &schema, Some(&db))?;
     for w in &plan.warnings {
         tracing::warn!("{w}");
@@ -185,6 +278,8 @@ fn prepare(config_path: &Path) -> Result<Prepared> {
     Ok(Prepared { config, schema, db, plan, server_version })
 }
 
+/// Generates sample rows of every table, so CHECKs that cannot be satisfied are found
+/// before anything is written. Returns the report as text.
 fn check_samples(plan: &Plan) -> Result<String> {
     let mut s = String::from("\nSample rows (CHECK constraints solved before writing):\n");
     let mut problems = Vec::new();
@@ -201,32 +296,35 @@ fn check_samples(plan: &Plan) -> Result<String> {
     } else {
         Err(Error::Validation(format!(
             "rows that satisfy every CHECK could not be generated:\n{}\nconstrain the columns involved under `columns:` (values, range) or raise generation.max_repair_steps",
-            problems.iter().map(|p| format!("  - {p}")).collect::<Vec<_>>().join("\n")
+            bullets(&problems)
         )))
     }
 }
 
 /// `dbgen validate`: everything short of writing.
-pub fn validate(config_path: &Path) -> Result<()> {
-    let p = prepare(config_path)?;
-    println!("Database: {} (ClickHouse {})", p.db.describe(), p.server_version);
+pub fn validate(config: Config) -> Result<()> {
+    let p = prepare(config)?;
+    println!("Database: {} ({} {})", p.db.describe(), p.db.dialect().product(), p.server_version);
     println!("{}", p.plan.render(&p.schema));
     println!("{}", check_samples(&p.plan)?);
     println!("Total rows to generate: {}", crate::report::thousands(p.plan.total_rows()));
     Ok(())
 }
 
-/// `dbgen apply`: runs every statement of the DDL input against the database, in order.
+/// `dbgen apply` with the configuration file `config_path`.
 pub fn apply(config_path: &Path, create_database: bool) -> Result<()> {
-    let config = Config::load(config_path)?;
-    let schema = load_schema(&config)?;
-    let db = Database::connect(&config)?;
+    apply_config(&Config::load(config_path)?, create_database)
+}
+
+/// `dbgen apply`: runs every statement of the DDL files against the database, in order.
+pub fn apply_config(config: &Config, create_database: bool) -> Result<()> {
+    if config.schema.is_empty() {
+        return Err(Error::Config("apply runs DDL files, and none are given: set `schema` (--schema)".into()));
+    }
+    let schema = schema_from_files(config)?;
+    let db = Database::connect(config)?;
     if create_database {
-        let Database::Clickhouse(c) = &db;
-        let mut admin = c.clone();
-        let name = admin.database.clone();
-        admin.database = "default".into();
-        admin.execute(&format!("CREATE DATABASE IF NOT EXISTS {}", crate::db::clickhouse::Client::quote(&name))).map_err(|e| e.into_error("creating the database"))?;
+        db.create_database().map_err(|e| e.into_error("creating the database"))?;
     }
     server_version(&db)?;
     let started = Instant::now();
@@ -237,115 +335,75 @@ pub fn apply(config_path: &Path, create_database: bool) -> Result<()> {
     Ok(())
 }
 
+/// Options of `dbgen generate`.
 pub struct GenerateOptions {
+    /// The configuration file, read by [`generate`]; [`generate_config`] takes the
+    /// configuration already resolved and ignores it.
     pub config_path: PathBuf,
+    /// Empty every generated table first.
     pub reset: bool,
+    /// Validate and print the plan, then stop.
     pub dry_run: bool,
+    /// Write the summary as JSON to this file.
     pub report: Option<PathBuf>,
+    /// Progress bars on a terminal (log lines otherwise).
     pub progress_bars: bool,
+    /// Run the verification checks after a successful load.
     pub verify: bool,
 }
 
+/// The result of `dbgen generate`. `summary` is absent after a dry run; `error` is set when
+/// the load or the verification failed after the load started.
 pub struct Outcome {
     pub summary: Option<Summary>,
     pub verification: Option<String>,
     pub error: Option<Error>,
 }
 
+/// `dbgen generate` with the configuration file `opts.config_path`.
 pub fn generate(opts: GenerateOptions) -> Result<Outcome> {
+    let config = Config::load(&opts.config_path)?;
+    generate_config(config, &opts)
+}
+
+/// `dbgen generate`: loads the configured rows, resuming an interrupted run.
+pub fn generate_config(config: Config, opts: &GenerateOptions) -> Result<Outcome> {
     let started = Instant::now();
-    let p = prepare(&opts.config_path)?;
+    let p = prepare(config)?;
     let samples = check_samples(&p.plan)?;
     if opts.dry_run {
         println!("{}", p.plan.render(&p.schema));
         println!("{samples}");
         return Ok(Outcome { summary: None, verification: None, error: None });
     }
-    let g = &p.config.generation;
     let fingerprint = p.plan.fingerprint(&p.schema);
-    let fresh = State {
-        format: state::FORMAT,
-        dbgen_version: env!("CARGO_PKG_VERSION").into(),
-        fingerprint: fingerprint.clone(),
-        database: p.db.describe(),
-        seed: g.seed,
-        batch_size: g.batch_size,
-        window: (Rfc3339(p.plan.window.0).to_string(), Rfc3339(p.plan.window.1).to_string()),
-        targets: p.plan.generated().map(|(_, t)| (t.name.clone(), t.rows)).collect(),
-        tables: Default::default(),
-        completed: false,
-        started_at: chrono::Utc::now().to_rfc3339(),
-        updated_at: String::new(),
-    };
     let state_path = state::path_for(&p.config, &p.db.state_key());
-    let count = |t: &str| p.db.count(t).map_err(|e| e.into_error(&format!("counting {t}")));
-    let mut st = if opts.reset {
-        for (_, tg) in p.plan.generated() {
-            p.db.truncate(&tg.name).map_err(|e| e.into_error(&format!("truncating {}", tg.name)))?;
-        }
-        tracing::info!(tables = p.plan.order.len(), "reset: generated tables truncated");
-        fresh
-    } else {
-        match State::load(&state_path)? {
-            Some(mut old) => {
-                let diffs = old.differences(&fresh);
-                if !diffs.is_empty() {
-                    return Err(Error::Validation(format!(
-                        "{} holds a run with different settings; restore them, or start over with --reset:\n{}",
-                        state_path.display(),
-                        diffs.iter().map(|d| format!("  - {d}")).collect::<Vec<_>>().join("\n")
-                    )));
-                }
-                for (_, tg) in p.plan.generated() {
-                    let live = count(&tg.name)?;
-                    let recorded = old.rows(&tg.name);
-                    if live != recorded {
-                        tracing::warn!(table = %tg.name, live, recorded, "row count differs from the resume state: reloading the table");
-                        p.db.truncate(&tg.name).map_err(|e| e.into_error(&format!("truncating {}", tg.name)))?;
-                        old.forget(&tg.name);
-                    }
-                }
-                if old.completed && p.plan.generated().all(|(_, tg)| old.rows(&tg.name) == tg.rows) {
-                    tracing::info!("the previous run with these settings completed; nothing to do");
-                }
-                old
-            }
-            None => {
-                let mut busy = Vec::new();
-                for (_, tg) in p.plan.generated() {
-                    let n = count(&tg.name)?;
-                    if n > 0 {
-                        busy.push(format!("{} ({n} rows)", tg.name));
-                    }
-                }
-                if !busy.is_empty() {
-                    return Err(Error::Validation(format!(
-                        "tables to generate already hold rows dbgen did not write: {}\nuse --reset to empty them first",
-                        busy.join(", ")
-                    )));
-                }
-                fresh
-            }
-        }
-    };
+    let mut st = resume_state(&p, &fingerprint, &state_path, opts.reset)?;
     st.completed = false;
     st.save(&state_path)?;
 
+    let g = &p.config.generation;
     engine::install_interrupt_handler();
     let stats = Arc::new(Stats::new(&p.plan, g.batch_size));
     let progress = Progress::start(stats.clone(), opts.progress_bars, Duration::from_secs(g.progress_interval_secs.max(1)));
     let state = Arc::new(Mutex::new(st));
     let load_started = Instant::now();
-    let result = Load { config: &p.config, schema: &p.schema, plan: &p.plan, db: &p.db, stats: stats.clone(), state: state.clone(), state_path: state_path.clone() }.run();
+    let load = Load { config: &p.config, schema: &p.schema, plan: &p.plan, db: &p.db, stats: stats.clone(), state: state.clone(), state_path: state_path.clone() };
+    let result = load.run();
     let load_seconds = load_started.elapsed().as_secs_f64();
     progress.stop();
 
-    let interrupted = matches!(result, Err(Error::Interrupted));
+    let mut error = result.err();
+    if error.is_none() {
+        let tables: Vec<&schema::Table> = p.plan.generated().map(|(ti, _)| &p.schema.tables[ti]).collect();
+        if let Err(e) = p.db.finish_load(&tables) {
+            tracing::warn!("after the load: {e}");
+        }
+    }
+    let interrupted = matches!(error, Some(Error::Interrupted));
     let finals: Vec<Option<u64>> = stats.tables.iter().map(|t| p.db.count(&t.name).ok()).collect();
     let tables = Summary::tables_from(&stats, &finals, interrupted);
-    let all_match = tables.iter().all(|t| t.final_rows == Some(t.target_rows));
-    let mut error = result.err();
-    if error.is_none() && !all_match {
+    if error.is_none() && !tables.iter().all(|t| t.final_rows == Some(t.target_rows)) {
         error = Some(Error::Db("final row counts differ from the targets (see Final Rows)".into()));
     }
     if error.is_none() {
@@ -378,27 +436,107 @@ pub fn generate(opts: GenerateOptions) -> Result<Outcome> {
             Some(Error::Interrupted) => OverallStatus::Interrupted,
             Some(_) => OverallStatus::Failed,
         },
-        error: error.as_ref().map(|e| e.to_string()),
+        error: error.as_ref().map(ToString::to_string),
     };
     if let Some(path) = &opts.report {
-        std::fs::write(path, serde_json::to_string_pretty(&summary).expect("serializable"))
-            .map_err(|e| Error::Config(format!("cannot write report {}: {e}", path.display())))?;
+        write_json(path, &summary)?;
     }
     Ok(Outcome { summary: Some(summary), verification, error })
 }
 
-/// `dbgen verify`.
-pub fn verify_only(config_path: &Path, report: Option<&Path>) -> Result<bool> {
-    let config = Config::load(config_path)?;
-    let schema = load_schema(&config)?;
-    let db = Database::connect(&config)?;
+/// The state to load with: fresh after `--reset` or on an empty database, or the state
+/// of the interrupted run to resume. Generated tables whose rows do not match the state
+/// are emptied, with the tables that reference them when the database checks foreign keys.
+fn resume_state(p: &Prepared, fingerprint: &str, state_path: &Path, reset: bool) -> Result<State> {
+    let g = &p.config.generation;
+    let fresh = State {
+        format: state::FORMAT,
+        dbgen_version: env!("CARGO_PKG_VERSION").into(),
+        fingerprint: fingerprint.to_string(),
+        database: p.db.describe(),
+        seed: g.seed,
+        batch_size: g.batch_size,
+        window: (Rfc3339(p.plan.window.0).to_string(), Rfc3339(p.plan.window.1).to_string()),
+        targets: p.plan.generated().map(|(_, t)| (t.name.clone(), t.rows)).collect(),
+        tables: Default::default(),
+        completed: false,
+        started_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: String::new(),
+    };
+    let truncate = |names: &[&str]| p.db.truncate(names).map_err(|e| e.into_error(&format!("emptying {}", names.join(", "))));
+    let count = |t: &str| p.db.count(t).map_err(|e| e.into_error(&format!("counting {t}")));
+    let generated: Vec<(usize, &str)> = p.plan.generated().map(|(ti, t)| (ti, t.name.as_str())).collect();
+
+    if reset {
+        truncate(&generated.iter().map(|(_, n)| *n).collect::<Vec<_>>())?;
+        tracing::info!(tables = generated.len(), "reset: generated tables emptied");
+        return Ok(fresh);
+    }
+    let Some(mut old) = State::load(state_path)? else {
+        let mut busy = Vec::new();
+        for (_, name) in &generated {
+            let n = count(name)?;
+            if n > 0 {
+                busy.push(format!("{name} ({n} rows)"));
+            }
+        }
+        if !busy.is_empty() {
+            return Err(Error::Validation(format!(
+                "tables to generate already hold rows dbgen did not write: {}\nuse --reset to empty them first",
+                busy.join(", ")
+            )));
+        }
+        return Ok(fresh);
+    };
+    let diffs = old.differences(&fresh);
+    if !diffs.is_empty() {
+        return Err(Error::Validation(format!(
+            "{} holds a run with different settings; restore them, or start over with --reset:\n{}",
+            state_path.display(),
+            bullets(&diffs)
+        )));
+    }
+    let mut reload: Vec<usize> = Vec::new();
+    for &(ti, name) in &generated {
+        let (live, recorded) = (count(name)?, old.rows(name));
+        if live != recorded && !reload.contains(&ti) {
+            tracing::warn!(table = %name, live, recorded, "row count differs from the resume state: reloading the table");
+            reload.push(ti);
+            if p.db.dialect().enforces_foreign_keys() {
+                for d in p.plan.dependents(ti) {
+                    if !reload.contains(&d) {
+                        reload.push(d);
+                    }
+                }
+            }
+        }
+    }
+    if !reload.is_empty() {
+        let names: Vec<&str> = reload.iter().map(|&ti| p.schema.tables[ti].name.as_str()).collect();
+        truncate(&names)?;
+        names.iter().for_each(|n| old.forget(n));
+    }
+    if old.completed && generated.iter().all(|&(ti, name)| old.rows(name) == p.plan.world.table(ti).rows) {
+        tracing::info!("the previous run with these settings completed; nothing to do");
+    }
+    Ok(old)
+}
+
+fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    std::fs::write(path, serde_json::to_string_pretty(value).expect("serializable"))
+        .map_err(|e| Error::Config(format!("cannot write report {}: {e}", path.display())))
+}
+
+/// `dbgen verify`. Returns whether every check passed.
+pub fn verify_only(config: &Config, report: Option<&Path>) -> Result<bool> {
+    let db = Database::connect(config)?;
     server_version(&db)?;
-    let plan = plan::build(&config, &schema, None)?;
+    let schema = load_schema_with(config, &db)?;
+    let plan = plan::build(config, &schema, None)?;
     let results = verify::run(&db, &schema, &plan);
     println!("{}", verify::render(&results));
     if let Some(path) = report {
-        std::fs::write(path, serde_json::to_string_pretty(&results).expect("serializable"))
-            .map_err(|e| Error::Config(format!("cannot write report {}: {e}", path.display())))?;
+        write_json(path, &results)?;
     }
     Ok(verify::all_passed(&results))
 }

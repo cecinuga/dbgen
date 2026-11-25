@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::error::{Error, Result};
 
+/// Version of the state file layout.
 pub const FORMAT: u32 = 1;
 
+/// What a load has committed, and the settings it ran with.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct State {
     pub format: u32,
@@ -28,6 +30,7 @@ pub struct State {
     pub updated_at: String,
 }
 
+/// The committed batches of one table.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TableState {
     /// Committed batch indices, as `[first, last]` ranges.
@@ -53,11 +56,13 @@ impl TableState {
         self.batches = ranges;
     }
 
+    /// Whether batch `batch` is committed.
     pub fn contains(&self, batch: u64) -> bool {
         self.set.contains(&batch)
     }
 }
 
+/// Where the state of the target `state_key` is kept.
 pub fn path_for(config: &Config, state_key: &str) -> PathBuf {
     match &config.generation.state_file {
         Some(p) if p.is_absolute() => p.clone(),
@@ -67,6 +72,7 @@ pub fn path_for(config: &Config, state_key: &str) -> PathBuf {
 }
 
 impl State {
+    /// Reads a state file; `None` when there is none.
     pub fn load(path: &Path) -> Result<Option<State>> {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -83,6 +89,7 @@ impl State {
         Ok(Some(s))
     }
 
+    /// Writes the state atomically (to a temporary file, then renamed).
     pub fn save(&mut self, path: &Path) -> Result<()> {
         for t in self.tables.values_mut() {
             t.compress();
@@ -96,14 +103,17 @@ impl State {
         std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, path)).map_err(|e| Error::Config(format!("cannot write {}: {e}", path.display())))
     }
 
+    /// The state of table `name`, created empty if needed.
     pub fn table(&mut self, name: &str) -> &mut TableState {
         self.tables.entry(name.to_string()).or_default()
     }
 
+    /// Rows committed in table `name`.
     pub fn rows(&self, name: &str) -> u64 {
         self.tables.get(name).map_or(0, |t| t.rows)
     }
 
+    /// Records a committed batch of `rows` rows.
     pub fn mark_done(&mut self, table: &str, batch: u64, rows: u64) {
         let t = self.table(table);
         if t.set.insert(batch) {
@@ -111,6 +121,7 @@ impl State {
         }
     }
 
+    /// Drops what is recorded for `table`, which will be loaded again.
     pub fn forget(&mut self, table: &str) {
         self.tables.remove(table);
     }

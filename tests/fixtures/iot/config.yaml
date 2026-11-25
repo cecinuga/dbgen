@@ -1,0 +1,28 @@
+# IoT telemetry: sites, devices, time-series readings and alerts. Shared by every dialect
+# of this schema; the tests add `database` and `schema`.
+generation:
+  seed: 31
+  batch_size: 5000
+  workers: 4
+  history_days: 90
+  end_time: "2026-01-01"
+
+tables:
+  sites: 20
+  device_models: 15
+  devices: 500
+  readings: 50000
+  alerts: 5000
+
+# `model_id` does not name the `device_models` table.
+relations:
+  - "devices.model_id -> device_models.model_id"
+  - { from: "readings.device_id", to: "devices.device_id", distribution: skewed, skew: 1.8 }
+
+columns:
+  sites.latitude: { range: [36.0, 47.0] }
+  sites.longitude: { range: [6.0, 18.0] }
+  sites.timezone: { values: [Europe/Rome, Europe/Paris, Europe/Berlin] }
+  readings.temperature: { range: [-10.0, 45.0] }
+  readings.humidity: { range: [5.0, 95.0] }
+  alerts.acknowledged_at: { after: raised_at, gap: [30s, 6h], null_rate: 0.3 }

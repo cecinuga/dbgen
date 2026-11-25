@@ -1,0 +1,28 @@
+# Human resources: a department tree, employees with managers, salary history and
+# timesheets. Shared by every dialect of this schema; the tests add `database` and `schema`.
+generation:
+  seed: 23
+  batch_size: 1500
+  workers: 3
+  history_days: 730
+  end_time: "2026-01-01"
+
+tables:
+  departments: 30
+  job_titles: 40
+  employees: 2000
+  salary_history: 6000
+  timesheets: 20000
+
+# ClickHouse has no foreign keys and these names do not reveal their parent table.
+relations:
+  - "departments.parent_department_id -> departments.department_id"
+  - "employees.manager_id -> employees.employee_id"
+
+columns:
+  # dbgen orders dates by itself, but not numbers: max_salary > min_salary needs ranges
+  # that cannot overlap.
+  job_titles.min_salary: { range: [18000, 60000] }
+  job_titles.max_salary: { range: [60001, 200000] }
+  employees.salary: { range: [18000, 150000] }
+  timesheets.project_code: { values: [APOLLO, BOREAS, CERES, DORADO, ERIS] }

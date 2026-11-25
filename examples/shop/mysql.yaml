@@ -1,0 +1,23 @@
+# The shop schema in mysql, loaded with synthetic data.
+#
+#   docker compose up -d mysql
+#   bin/dbgen apply    -c examples/shop/mysql.yaml --create-database
+#   bin/dbgen generate -c examples/shop/mysql.yaml --verify
+database: "mysql://root:dbgen@localhost:13306/shop"
+schema: ../../tests/fixtures/shop.mysql.sql
+
+generation:
+  seed: 7
+  history_days: 90
+  end_time: "2026-01-01"
+
+tables:
+  categories: 40
+  customers: 2000
+  products: 300
+  orders: 20000
+  order_lines: 50000
+  countries: existing
+
+columns:
+  orders.channel: { values: [store, web, app], weights: [2, 5, 3] }

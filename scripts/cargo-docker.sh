@@ -15,6 +15,6 @@ tty_args=()
 if [ -t 1 ]; then tty_args=(-t); fi
 docker run --rm "${tty_args[@]}" --network host \
   -e CARGO_HOME=/cargo-home -e CARGO_TARGET_DIR=/target \
-  -e DBGEN_TEST_CLICKHOUSE_URL -e RUST_BACKTRACE -e RUST_LOG \
+  -e DBGEN_TEST_CLICKHOUSE_URL -e DBGEN_TEST_POSTGRES_URL -e DBGEN_TEST_MYSQL_URL -e RUST_BACKTRACE -e RUST_LOG \
   -v dbgen-cargo-home:/cargo-home -v dbgen-target:/target -v "$here:/work" -w /work \
   "$image" bash -c 'cargo "$@" && if [ -x /target/release/dbgen ]; then mkdir -p bin && cp -u /target/release/dbgen bin/; fi' cargo "$@"

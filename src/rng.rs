@@ -52,14 +52,17 @@ pub fn unit(key: u64) -> f64 {
 pub struct Rng(u64);
 
 impl Rng {
+    /// The stream of `key`.
     pub fn new(key: u64) -> Self {
         Rng(mix(key ^ GOLDEN))
     }
 
+    /// The stream of a combination of parts (seed, tags, row index...).
     pub fn at(parts: &[u64]) -> Self {
         Rng::new(hash(parts))
     }
 
+    /// The next 64 random bits.
     #[inline]
     pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(GOLDEN);
@@ -99,6 +102,7 @@ impl Rng {
         lo + self.below_u128(span + 1) as i128
     }
 
+    /// True with probability `p`.
     #[inline]
     pub fn chance(&mut self, p: f64) -> bool {
         self.f64() < p
@@ -118,6 +122,7 @@ impl Rng {
         cumulative.partition_point(|&c| c <= x).min(cumulative.len() - 1)
     }
 
+    /// A uniformly chosen item; `items` must not be empty.
     pub fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
         &items[self.below(items.len() as u64) as usize]
     }

@@ -8,6 +8,7 @@ use std::fmt;
 
 use crate::timeutil::{day_of, Rfc3339, Ymd, US_PER_DAY};
 
+/// A value of any column type, or NULL.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
@@ -33,6 +34,7 @@ pub enum Value {
 }
 
 impl Value {
+    /// Whether the value is NULL.
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
@@ -49,6 +51,7 @@ impl Value {
         }
     }
 
+    /// The value as a number, for arithmetic.
     pub fn num(&self) -> Option<Num> {
         match self {
             Value::Bool(b) => Some(Num::I(*b as i128)),
@@ -59,6 +62,7 @@ impl Value {
         }
     }
 
+    /// The value as a float, when it is numeric.
     pub fn as_f64(&self) -> Option<f64> {
         self.num().map(Num::to_f64)
     }
@@ -102,6 +106,7 @@ impl Value {
         }
     }
 
+    /// The kind of value, for messages.
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::Null => "NULL",
@@ -152,6 +157,7 @@ fn join(items: &[Value]) -> String {
     items.iter().map(Value::to_string).collect::<Vec<_>>().join(", ")
 }
 
+/// `unscaled / 10^scale` in decimal notation.
 pub fn format_decimal(unscaled: i128, scale: u8) -> String {
     if scale == 0 {
         return unscaled.to_string();
@@ -162,11 +168,13 @@ pub fn format_decimal(unscaled: i128, scale: u8) -> String {
     format!("{sign}{}.{:0width$}", a / p as u128, a % p as u128, width = scale as usize)
 }
 
+/// The canonical `8-4-4-4-12` form of a UUID.
 pub fn format_uuid(u: u128) -> String {
     let h = format!("{u:032x}");
     format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
 }
 
+/// Parses a UUID, with or without dashes.
 pub fn parse_uuid(s: &str) -> Option<u128> {
     let hex: String = s.chars().filter(|c| *c != '-').collect();
     if hex.len() != 32 {
@@ -190,6 +198,9 @@ pub enum Num {
     F(f64),
 }
 
+// The arithmetic methods return `None` on overflow or division by zero (SQL's NULL), so
+// they cannot implement the `std::ops` traits whose names they share.
+#[allow(clippy::should_implement_trait)]
 impl Num {
     pub fn to_f64(self) -> f64 {
         match self {
@@ -285,6 +296,7 @@ impl Num {
         })
     }
 
+    /// The number as a value.
     pub fn into_value(self) -> Value {
         match self {
             Num::I(i) => Value::Int(i),

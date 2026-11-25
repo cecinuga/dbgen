@@ -20,16 +20,22 @@ use crate::value::Value;
 
 /// Bump when a change makes the same seed and configuration produce different data, so
 /// a resume across versions is refused.
-pub const MODEL_VERSION: u32 = 1;
+///
+/// 2: a table that references itself points at earlier rows only.
+pub const MODEL_VERSION: u32 = 2;
 
+/// What the load does with a table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
+    /// Generate exactly this many rows.
     Generate(u64),
     /// Not written; read when referenced.
     Existing,
+    /// Neither written nor read.
     Skip,
 }
 
+/// The plan for one table of the schema.
 #[derive(Debug, Clone)]
 pub struct TablePlan {
     pub name: String,
@@ -38,30 +44,48 @@ pub struct TablePlan {
     pub reason: Option<String>,
 }
 
+/// A relation by table and column names, for display and verification.
 #[derive(Debug, Clone)]
 pub struct RelationInfo {
     pub child: String,
     pub child_cols: Vec<String>,
     pub parent: String,
     pub parent_cols: Vec<String>,
+    /// Where it was found: `config`, `ddl` or `inferred`.
     pub source: &'static str,
 }
 
+/// Everything needed to generate and load the data, validated.
 pub struct Plan {
+    /// The generators of every table.
     pub world: World,
+    /// One entry per schema table, in schema order.
     pub tables: Vec<TablePlan>,
     pub relations: Vec<RelationInfo>,
+    /// Start and end of the time window, in microseconds since the epoch.
     pub window: (i64, i64),
     pub warnings: Vec<String>,
     /// Generated tables, parents before children.
     pub order: Vec<usize>,
+    /// The same tables by dependency level: a table's parents are all in earlier levels
+    /// (references to itself aside).
+    pub levels: Vec<Vec<usize>>,
 }
 
 /// Reads rows of tables that are referenced but not generated.
 pub trait RowSource {
+    /// Up to `limit` distinct rows of `columns`, in a deterministic order.
     fn read_rows(&self, table: &Table, columns: &[usize], limit: u64) -> Result<Vec<Vec<Value>>>;
 }
 
+/// What validation found: problems stop the run, warnings are reported.
+#[derive(Default)]
+struct Findings {
+    problems: Vec<String>,
+    warnings: Vec<String>,
+}
+
+/// A relation found in the configuration, the DDL or the column names, by indices.
 struct RelDraft {
     child: usize,
     child_cols: Vec<usize>,
@@ -72,35 +96,92 @@ struct RelDraft {
     skew: f64,
 }
 
+impl RelDraft {
+    fn info(&self, schema: &Schema) -> RelationInfo {
+        let (child, parent) = (&schema.tables[self.child], &schema.tables[self.parent]);
+        RelationInfo {
+            child: child.name.clone(),
+            child_cols: self.child_cols.iter().map(|&c| child.columns[c].name.clone()).collect(),
+            parent: parent.name.clone(),
+            parent_cols: self.parent_cols.iter().map(|&c| parent.columns[c].name.clone()).collect(),
+            source: self.source,
+        }
+    }
+}
+
+/// Builds and validates the plan. `rows` reads the tables that are referenced but not
+/// generated; without it (no database), references to them are left unresolved.
 pub fn build(config: &Config, schema: &Schema, rows: Option<&dyn RowSource>) -> Result<Plan> {
     let g = &config.generation;
-    let mut problems: Vec<String> = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
+    let mut found = Findings::default();
+    let window = time_window(g)?;
+    let tables = table_modes(config, schema, &mut found);
+    let generated: Vec<bool> = tables.iter().map(|t| matches!(t.mode, Mode::Generate(_))).collect();
+    let drafts = find_relations(config, schema, &generated, &mut found);
+    let existing = read_referenced_rows(schema, &generated, &drafts, rows, g.max_existing_rows)?;
 
-    // Time window.
+    let mut world = World {
+        seed: g.seed,
+        ctx: EvalCtx { now_us: window.1 },
+        tables: vec![None; schema.tables.len()],
+        relations: Vec::new(),
+        products: Vec::new(),
+        existing,
+    };
+    for d in &drafts {
+        let parent_rows = match tables[d.parent].mode {
+            Mode::Generate(n) => n,
+            _ => world.existing[d.parent].as_ref().map_or(0, |e| e.rows.len() as u64),
+        };
+        world.relations.push(relation_gen(d, schema, parent_rows));
+    }
+    for (ti, tp) in tables.iter().enumerate() {
+        if let Mode::Generate(n) = tp.mode {
+            world.tables[ti] = Some(build_table(config, schema, ti, n, window, &mut world, &mut found));
+        }
+    }
+    make_referenced_keys_unique(&mut world, g.seed, window);
+    resolve_references_to_empty_tables(&mut world, schema, &tables, rows.is_some(), &mut found);
+    check_reference_ranges(&world, &mut found.problems);
+    detect_cycles(&world, schema, &mut found.problems);
+    if !found.problems.is_empty() {
+        return Err(Error::Validation(found.problems.iter().map(|p| format!("  - {p}")).collect::<Vec<_>>().join("\n")));
+    }
+
+    let relations = drafts.iter().map(|d| d.info(schema)).collect();
+    let levels = load_levels(&world, &tables);
+    let order = levels.concat();
+    Ok(Plan { world, tables, relations, window, warnings: found.warnings, order, levels })
+}
+
+/// `history_days` ending at `end_time` (default: today 00:00 UTC), in microseconds.
+fn time_window(g: &crate::config::Generation) -> Result<(i64, i64)> {
     let end = match &g.end_time {
         Some(s) => parse_instant(s).map_err(|e| Error::Config(format!("generation.end_time: {e}")))?,
         None => today_utc_midnight(),
     };
-    let window = (end - g.history_days as i64 * US_PER_DAY, end);
+    Ok((end - i64::from(g.history_days) * US_PER_DAY, end))
+}
 
-    // Table modes.
+/// What happens to each table of the schema, from `tables` or, for tables it does not
+/// list, from what the DDL says about them.
+fn table_modes(config: &Config, schema: &Schema, found: &mut Findings) -> Vec<TablePlan> {
     for name in config.tables.keys() {
         if schema.table(name).is_none() {
-            problems.push(format!("tables.{name}: no such table in the schema{}", suggest(name, schema.tables.iter().map(|t| t.name.as_str()))));
+            found.problems.push(format!("tables.{name}: no such table in the schema{}", suggest(name, schema.tables.iter().map(|t| t.name.as_str()))));
         }
     }
     let mut missing = Vec::new();
-    let mut tables: Vec<TablePlan> = Vec::new();
+    let mut tables = Vec::new();
     for t in &schema.tables {
         let (mode, reason) = match config.tables.get(&t.name) {
-            Some(TableTarget::Rows(0)) | Some(TableTarget::Skip) => (Mode::Skip, None),
+            Some(TableTarget::Rows(0) | TableTarget::Skip) => (Mode::Skip, None),
             Some(TableTarget::Rows(n)) => {
                 if !t.storage {
-                    problems.push(format!("tables.{}: engine {} does not store rows", t.name, t.engine.as_deref().unwrap_or("?")));
+                    found.problems.push(format!("tables.{}: engine {} does not store rows", t.name, t.engine.as_deref().unwrap_or("?")));
                 }
-                if t.derived_by.is_some() {
-                    warnings.push(format!("table {}: materialized view {} also writes into it", t.name, t.derived_by.as_deref().unwrap_or("")));
+                if let Some(view) = &t.derived_by {
+                    found.warnings.push(format!("table {}: materialized view {view} also writes into it", t.name));
                 }
                 (Mode::Generate(*n), None)
             }
@@ -108,35 +189,43 @@ pub fn build(config: &Config, schema: &Schema, rows: Option<&dyn RowSource>) -> 
             None if t.seeded => (Mode::Existing, Some("seeded by the DDL input".to_string())),
             None if t.derived_by.is_some() => (Mode::Existing, Some(format!("written by materialized view {}", t.derived_by.as_deref().unwrap_or("")))),
             None if !t.storage => (Mode::Skip, Some("does not store rows".to_string())),
-            None => {
-                missing.push(t.name.clone());
-                (Mode::Existing, Some("not in the configuration".to_string()))
-            }
+            None => match config.generation.default_rows {
+                Some(0) => (Mode::Skip, Some("default_rows is 0".to_string())),
+                Some(n) => (Mode::Generate(n), Some("default_rows".to_string())),
+                None => {
+                    missing.push(t.name.clone());
+                    (Mode::Existing, Some("not in the configuration".to_string()))
+                }
+            },
         };
         tables.push(TablePlan { name: t.name.clone(), mode, reason });
     }
     if !missing.is_empty() {
         let msg = format!("tables not in the configuration, left as they are: {}", missing.join(", "));
-        match g.missing_tables {
-            MissingTables::Warn => warnings.push(msg),
-            MissingTables::Error => problems.push(msg),
+        match config.generation.missing_tables {
+            MissingTables::Warn => found.warnings.push(msg),
+            MissingTables::Error => found.problems.push(msg),
         }
     }
-    let generated = |ti: usize| matches!(tables[ti].mode, Mode::Generate(_));
+    tables
+}
 
-    // Relations: configured first, then DDL foreign keys, then inferred, each skipping
-    // child columns already covered.
+/// The relations of generated tables: configured first, then DDL foreign keys, then
+/// inferred from names, each skipping child columns an earlier source covers.
+fn find_relations(config: &Config, schema: &Schema, generated: &[bool], found: &mut Findings) -> Vec<RelDraft> {
     let mut drafts: Vec<RelDraft> = Vec::new();
     let mut covered: HashSet<(usize, usize)> = HashSet::new();
-    let ignored: HashSet<(String, String)> =
-        config.ignore_relations.iter().flat_map(|r| r.columns.iter().map(move |c| (r.table.clone(), c.clone()))).collect();
+    let ignored: HashSet<(&str, &str)> =
+        config.ignore_relations.iter().flat_map(|r| r.columns.iter().map(move |c| (r.table.as_str(), c.as_str()))).collect();
+    let problems = &mut found.problems;
+
     for rc in &config.relations {
         let (Some(ci), Some(pi)) = (schema.table_index(&rc.from.table), schema.table_index(&rc.to.table)) else {
             problems.push(format!("relation {} -> {}: no such table", rc.from, rc.to));
             continue;
         };
-        let child_cols = resolve_cols(&schema.tables[ci], &rc.from.columns, &mut problems, &format!("relation {}", rc.from));
-        let parent_cols = resolve_cols(&schema.tables[pi], &rc.to.columns, &mut problems, &format!("relation {}", rc.to));
+        let child_cols = resolve_cols(&schema.tables[ci], &rc.from.columns, problems, &format!("relation {}", rc.from));
+        let parent_cols = resolve_cols(&schema.tables[pi], &rc.to.columns, problems, &format!("relation {}", rc.to));
         let (Some(child_cols), Some(parent_cols)) = (child_cols, parent_cols) else { continue };
         for (c, p) in child_cols.iter().zip(&parent_cols) {
             let (ct, pt) = (&schema.tables[ci].columns[*c].ty, &schema.tables[pi].columns[*p].ty);
@@ -144,18 +233,14 @@ pub fn build(config: &Config, schema: &Schema, rows: Option<&dyn RowSource>) -> 
                 problems.push(format!("relation {} -> {}: {ct} and {pt} are not compatible", rc.from, rc.to));
             }
         }
-        if !generated(ci) {
-            continue;
+        if generated[ci] {
+            covered.extend(child_cols.iter().map(|&c| (ci, c)));
+            drafts.push(RelDraft { child: ci, child_cols, parent: pi, parent_cols, source: "config", distribution: rc.distribution, skew: rc.skew });
         }
-        child_cols.iter().for_each(|c| {
-            covered.insert((ci, *c));
-        });
-        drafts.push(RelDraft { child: ci, child_cols, parent: pi, parent_cols, source: "config", distribution: rc.distribution, skew: rc.skew });
     }
-    for (ci, t) in schema.tables.iter().enumerate() {
-        if !generated(ci) {
-            continue;
-        }
+
+    for (ci, t) in schema.tables.iter().enumerate().filter(|&(ci, _)| generated[ci]) {
+        let is_ignored = |c: usize| ignored.contains(&(t.name.as_str(), t.columns[c].name.as_str()));
         for fk in &t.foreign_keys {
             let Some(pi) = schema.table_index(&fk.ref_table) else {
                 problems.push(format!("table {}: foreign key to {}, which the schema does not define", t.name, fk.ref_table));
@@ -174,152 +259,153 @@ pub fn build(config: &Config, schema: &Schema, rows: Option<&dyn RowSource>) -> 
                 fk.ref_columns.clone()
             };
             let ctx = format!("table {} foreign key", t.name);
-            let (Some(child_cols), Some(parent_cols)) = (resolve_cols(t, &fk.columns, &mut problems, &ctx), resolve_cols(parent, &ref_cols, &mut problems, &ctx)) else {
+            let (Some(child_cols), Some(parent_cols)) = (resolve_cols(t, &fk.columns, problems, &ctx), resolve_cols(parent, &ref_cols, problems, &ctx)) else {
                 continue;
             };
-            if child_cols.iter().any(|c| covered.contains(&(ci, *c)) || ignored.contains(&(t.name.clone(), t.columns[*c].name.clone()))) {
+            if child_cols.iter().any(|&c| covered.contains(&(ci, c)) || is_ignored(c)) {
                 continue;
             }
-            child_cols.iter().for_each(|c| {
-                covered.insert((ci, *c));
-            });
+            covered.extend(child_cols.iter().map(|&c| (ci, c)));
             drafts.push(RelDraft { child: ci, child_cols, parent: pi, parent_cols, source: "ddl", distribution: Distribution::Uniform, skew: 1.5 });
         }
-        if g.infer_relations {
-            // Columns naming the same parent in the same role (`patient_key` and
-            // `patient_id`, but not `acknowledger_staff_key` and `resolver_staff_key`) form
-            // one reference, so they point at the same parent row.
-            let mut groups: Vec<((usize, String), Vec<(usize, usize)>)> = Vec::new();
-            for (c, col) in t.columns.iter().enumerate() {
-                if covered.contains(&(ci, c)) || ignored.contains(&(t.name.clone(), col.name.clone())) || !col.insertable() || col.fixed.is_some() {
-                    continue;
-                }
-                if config.column(&t.name, &col.name).is_some_and(|cc| cc.values.is_some() || cc.value.is_some() || cc.range.is_some()) {
-                    continue;
-                }
-                if let Some((pi, pc, role)) = infer_relation(schema, ci, c) {
-                    covered.insert((ci, c));
-                    match groups.iter_mut().find(|(k, _)| *k == (pi, role.clone())) {
-                        Some((_, cols)) if !cols.iter().any(|&(_, p)| p == pc) => cols.push((c, pc)),
-                        Some(_) => {
-                            covered.remove(&(ci, c));
-                        }
-                        None => groups.push(((pi, role), vec![(c, pc)])),
-                    }
-                }
-            }
-            for ((pi, _), pairs) in groups {
-                drafts.push(RelDraft {
-                    child: ci,
-                    child_cols: pairs.iter().map(|p| p.0).collect(),
-                    parent: pi,
-                    parent_cols: pairs.iter().map(|p| p.1).collect(),
-                    source: "inferred",
-                    distribution: Distribution::Uniform,
-                    skew: 1.5,
-                });
-            }
+        if config.generation.infer_relations {
+            drafts.extend(infer_relations(config, schema, ci, &mut covered, &is_ignored));
         }
     }
+    drafts
+}
 
-    // Rows of referenced tables that are not generated.
-    let mut existing: Vec<Option<ExistingRows>> = vec![None; schema.tables.len()];
-    let mut needed: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
-    for d in &drafts {
-        if !generated(d.parent) {
-            needed.entry(d.parent).or_default().extend(d.parent_cols.iter().copied());
+/// Columns of one table inferred to reference the same parent in the same role.
+struct InferredRef {
+    parent: usize,
+    role: String,
+    /// `(child column, parent column)`.
+    pairs: Vec<(usize, usize)>,
+}
+
+/// The relations of table `ci` that its column names suggest. Columns naming the same
+/// parent in the same role (`patient_key` and `patient_id`, but not
+/// `acknowledger_staff_key` and `resolver_staff_key`) form one reference, so they point
+/// at the same parent row.
+fn infer_relations(config: &Config, schema: &Schema, ci: usize, covered: &mut HashSet<(usize, usize)>, is_ignored: &dyn Fn(usize) -> bool) -> Vec<RelDraft> {
+    let t = &schema.tables[ci];
+    let mut refs: Vec<InferredRef> = Vec::new();
+    for (c, col) in t.columns.iter().enumerate() {
+        if covered.contains(&(ci, c)) || is_ignored(c) || !col.insertable() || col.fixed.is_some() {
+            continue;
+        }
+        if config.column(&t.name, &col.name).is_some_and(|cc| cc.values.is_some() || cc.value.is_some() || cc.range.is_some()) {
+            continue;
+        }
+        let Some((pi, pc, role)) = infer_relation(schema, ci, c) else { continue };
+        match refs.iter_mut().find(|r| r.parent == pi && r.role == role) {
+            Some(r) if r.pairs.iter().any(|&(_, p)| p == pc) => {}
+            Some(r) => {
+                r.pairs.push((c, pc));
+                covered.insert((ci, c));
+            }
+            None => {
+                refs.push(InferredRef { parent: pi, role, pairs: vec![(c, pc)] });
+                covered.insert((ci, c));
+            }
         }
     }
+    refs.into_iter()
+        .map(|r| RelDraft {
+            child: ci,
+            child_cols: r.pairs.iter().map(|p| p.0).collect(),
+            parent: r.parent,
+            parent_cols: r.pairs.iter().map(|p| p.1).collect(),
+            source: "inferred",
+            distribution: Distribution::Uniform,
+            skew: 1.5,
+        })
+        .collect()
+}
+
+/// Reads the rows that generated tables reference in tables that are not generated.
+fn read_referenced_rows(
+    schema: &Schema,
+    generated: &[bool],
+    drafts: &[RelDraft],
+    rows: Option<&dyn RowSource>,
+    limit: u64,
+) -> Result<Vec<Option<ExistingRows>>> {
+    let mut needed: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    for d in drafts.iter().filter(|d| !generated[d.parent]) {
+        needed.entry(d.parent).or_default().extend(d.parent_cols.iter().copied());
+    }
+    let mut existing: Vec<Option<ExistingRows>> = vec![None; schema.tables.len()];
     for (pi, cols) in needed {
-        let cols: Vec<usize> = cols.into_iter().collect();
+        let columns: Vec<usize> = cols.into_iter().collect();
         let data = match rows {
-            Some(src) => src.read_rows(&schema.tables[pi], &cols, g.max_existing_rows)?,
+            Some(src) => src.read_rows(&schema.tables[pi], &columns, limit)?,
             None => Vec::new(),
         };
-        existing[pi] = Some(ExistingRows { columns: cols, rows: data });
+        existing[pi] = Some(ExistingRows { columns, rows: data });
     }
-    let parent_counts: Vec<u64> = (0..schema.tables.len())
-        .map(|pi| match tables[pi].mode {
-            Mode::Generate(n) => n,
-            _ => existing[pi].as_ref().map_or(0, |e| e.rows.len() as u64),
-        })
-        .collect();
-    let parent_rows = |pi: usize| parent_counts[pi];
+    Ok(existing)
+}
 
-    let mut world = World {
-        seed: g.seed,
-        ctx: EvalCtx { now_us: window.1 },
-        tables: vec![None; schema.tables.len()],
-        existing,
-        relations: Vec::new(),
-        products: Vec::new(),
+/// The generator of a relation: how a child row picks its parent row.
+fn relation_gen(d: &RelDraft, schema: &Schema, parent_rows: u64) -> RelGen {
+    let rel_tag = hash(&[tag(&schema.tables[d.child].name), tag(&schema.tables[d.parent].name), d.child_cols[0] as u64, 0x72656c]);
+    let pick = match d.distribution {
+        // Earlier rows only: hierarchies stay acyclic, and rows loaded in order satisfy
+        // the foreign key.
+        _ if d.child == d.parent => Pick::Earlier,
+        Distribution::Uniform => Pick::Uniform,
+        Distribution::Skewed => Pick::Skewed { skew: d.skew, perm: Perm::new(parent_rows.max(1), rel_tag) },
     };
-    for d in &drafts {
-        let rel_tag = hash(&[tag(&schema.tables[d.child].name), tag(&schema.tables[d.parent].name), d.child_cols[0] as u64, 0x72656c]);
-        let n = parent_rows(d.parent);
-        let pick = match d.distribution {
-            Distribution::Uniform => Pick::Uniform,
-            Distribution::Skewed => Pick::Skewed { skew: d.skew, perm: Perm::new(n.max(1), rel_tag) },
-        };
-        world.relations.push(RelGen {
-            child: d.child,
-            parent: d.parent,
-            child_cols: d.child_cols.clone(),
-            parent_cols: d.parent_cols.clone(),
-            parent_rows: n,
-            pick,
-            tag: rel_tag,
-        });
+    RelGen {
+        child: d.child,
+        parent: d.parent,
+        child_cols: d.child_cols.clone(),
+        parent_cols: d.parent_cols.clone(),
+        parent_rows,
+        pick,
+        tag: rel_tag,
     }
+}
 
-    // Column strategies, table by table.
-    for (ti, t) in schema.tables.iter().enumerate() {
-        if let Mode::Generate(n) = tables[ti].mode {
-            let tg = build_table(config, schema, ti, n, window, &mut world, &mut problems, &mut warnings);
-            world.tables[ti] = Some(tg);
-            let _ = t;
-        }
-    }
-    // A unique parent key makes references unambiguous: turn referenced columns into
-    // unique ones where the plan left them random.
+/// A unique parent key makes references unambiguous: referenced single columns that the
+/// plan left random become unique.
+fn make_referenced_keys_unique(world: &mut World, seed: u64, window: (i64, i64)) {
     for r in 0..world.relations.len() {
-        let (parent, cols) = (world.relations[r].parent, world.relations[r].parent_cols.clone());
-        if cols.len() != 1 {
-            continue;
-        }
+        let (parent, cols) = (world.relations[r].parent, &world.relations[r].parent_cols);
+        let &[col] = cols.as_slice() else { continue };
         let Some(tg) = world.tables[parent].as_mut() else { continue };
-        let rows = tg.rows;
-        let col = cols[0];
-        if matches!(tg.cols[col].strategy, Strategy::Random(_)) && tg.checks.iter().all(|c| !c.expr.references(col)) {
-            if let Some(u) = make_unique(&tg.cols[col], rows, g.seed, tg.tag, window) {
-                tg.cols[col].describe = describe_unique(&u);
-                tg.cols[col].strategy = Strategy::Unique(u);
-                tg.cols[col].mutability = Mutability::Fixed;
-                tg.cols[col].pure = true;
-            }
-        }
-    }
-    // Relations to tables with no rows.
-    for r in 0..world.relations.len() {
-        let rel = &world.relations[r];
-        if rel.parent_rows > 0 {
+        if !matches!(tg.cols[col].strategy, Strategy::Random(_)) || tg.checks.iter().any(|c| c.expr.references(col)) {
             continue;
         }
+        if let Some(u) = make_unique(&tg.cols[col], tg.rows, seed, tg.tag, window) {
+            tg.cols[col].describe = describe_unique(&u);
+            tg.cols[col].strategy = Strategy::Unique(u);
+            tg.cols[col].mutability = Mutability::Fixed;
+            tg.cols[col].pure = true;
+        }
+    }
+}
+
+/// References to tables without rows: left NULL when the columns allow it, a problem
+/// otherwise. Without a database (`have_rows` false) tables that are not generated have
+/// not been read, so this is only noted.
+fn resolve_references_to_empty_tables(world: &mut World, schema: &Schema, tables: &[TablePlan], have_rows: bool, found: &mut Findings) {
+    for rel in world.relations.iter().filter(|r| r.parent_rows == 0) {
         let (child, parent) = (&schema.tables[rel.child], &schema.tables[rel.parent]);
         let tg = world.tables[rel.child].as_mut().expect("child is generated");
-        let all_nullable = rel.child_cols.iter().all(|&c| tg.cols[c].nullable);
-        let what = if matches!(tables[rel.parent].mode, Mode::Generate(_)) || rows.is_some() { "has no rows" } else { "is not read without a database" };
-        if all_nullable {
+        let what = if matches!(tables[rel.parent].mode, Mode::Generate(_)) || have_rows { "has no rows" } else { "is not read without a database" };
+        if rel.child_cols.iter().all(|&c| tg.cols[c].nullable) {
             for &c in &rel.child_cols {
                 tg.cols[c].strategy = Strategy::Constant(Value::Null);
                 tg.cols[c].mutability = Mutability::Fixed;
                 tg.cols[c].describe = format!("NULL ({} {what})", parent.name);
             }
-            if rows.is_some() {
-                warnings.push(format!("{}.{} references {}, which {what}: the column is left NULL", child.name, names(child, &rel.child_cols), parent.name));
+            if have_rows {
+                found.warnings.push(format!("{}.{} references {}, which {what}: the column is left NULL", child.name, names(child, &rel.child_cols), parent.name));
             }
-        } else if rows.is_some() {
-            problems.push(format!(
+        } else if have_rows {
+            found.problems.push(format!(
                 "{}.{} references {}, which {what}, and is not nullable: give {} a row count, or remove the relation",
                 child.name,
                 names(child, &rel.child_cols),
@@ -328,12 +414,14 @@ pub fn build(config: &Config, schema: &Schema, rows: Option<&dyn RowSource>) -> 
             ));
         }
     }
-    // References must fit the child column: a parent sequence can outgrow a narrower type.
+}
+
+/// References must fit the child column: a parent sequence can outgrow a narrower type.
+fn check_reference_ranges(world: &World, problems: &mut Vec<String>) {
     for rel in &world.relations {
         let Some(ptg) = world.tables[rel.parent].as_ref() else { continue };
-        let ctg = world.tables[rel.child].as_ref().expect("child is generated");
-        for (k, &pc) in rel.parent_cols.iter().enumerate() {
-            let cc = rel.child_cols[k];
+        let ctg = world.table(rel.child);
+        for (&pc, &cc) in rel.parent_cols.iter().zip(&rel.child_cols) {
             if let (Strategy::Unique(Unique::Int { start, step }), Some((lo, hi))) = (&ptg.cols[pc].strategy, ctg.cols[cc].ty.int_range()) {
                 let last = start + step * (ptg.rows.max(1) as i128 - 1);
                 if *start < lo || last > hi {
@@ -345,24 +433,6 @@ pub fn build(config: &Config, schema: &Schema, rows: Option<&dyn RowSource>) -> 
             }
         }
     }
-    detect_cycles(&world, schema, &mut problems);
-
-    if !problems.is_empty() {
-        return Err(Error::Validation(problems.iter().map(|p| format!("  - {p}")).collect::<Vec<_>>().join("\n")));
-    }
-
-    let relations = drafts
-        .iter()
-        .map(|d| RelationInfo {
-            child: schema.tables[d.child].name.clone(),
-            child_cols: d.child_cols.iter().map(|&c| schema.tables[d.child].columns[c].name.clone()).collect(),
-            parent: schema.tables[d.parent].name.clone(),
-            parent_cols: d.parent_cols.iter().map(|&c| schema.tables[d.parent].columns[c].name.clone()).collect(),
-            source: d.source,
-        })
-        .collect();
-    let order = load_order(&world, &tables);
-    Ok(Plan { world, tables, relations, window, warnings, order })
 }
 
 fn names(t: &Table, cols: &[usize]) -> String {
@@ -388,6 +458,7 @@ fn resolve_cols(t: &Table, cols: &[String], problems: &mut Vec<String>, ctx: &st
     Some(out)
 }
 
+/// ` (did you mean X?)` when one of `candidates` is close to `name`.
 pub fn suggest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> String {
     let best = candidates.map(|c| (strsim::jaro_winkler(name, c), c)).filter(|(s, _)| *s > 0.85).max_by(|a, b| a.0.total_cmp(&b.0));
     best.map_or(String::new(), |(_, c)| format!(" (did you mean {c}?)"))
@@ -532,7 +603,6 @@ fn configured_domain(cfg: &ColumnConfig, ty: &DataType, window: (i64, i64)) -> s
     Ok(None)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_table(
     config: &Config,
     schema: &Schema,
@@ -540,8 +610,7 @@ fn build_table(
     rows: u64,
     window: (i64, i64),
     world: &mut World,
-    problems: &mut Vec<String>,
-    warnings: &mut Vec<String>,
+    found: &mut Findings,
 ) -> TableGen {
     let g = &config.generation;
     let t = &schema.tables[ti];
@@ -554,7 +623,7 @@ fn build_table(
     for ch in &t.checks {
         match compiler.compile(&ch.expr) {
             Ok(e) => checks.push((ch.name.clone(), ch.sql.clone(), e)),
-            Err(m) => warnings.push(format!("table {}: CHECK {} is not evaluated by dbgen ({m}); the database may reject rows", t.name, ch.name)),
+            Err(m) => found.warnings.push(format!("table {}: CHECK {} is not evaluated by dbgen ({m}); the database may reject rows", t.name, ch.name)),
         }
     }
     let mut check_cols = BTreeSet::new();
@@ -605,7 +674,7 @@ fn build_table(
             match yaml_value(v, &col.ty) {
                 Ok(v) => Strategy::Constant(v),
                 Err(e) => {
-                    problems.push(format!("columns.{}.{}: {e}", t.name, col.name));
+                    found.problems.push(format!("columns.{}.{}: {e}", t.name, col.name));
                     Strategy::Skip
                 }
             }
@@ -622,13 +691,13 @@ fn build_table(
             Strategy::Skip
         } else if let Some(u) = col.ty.unsupported() {
             if nullable {
-                warnings.push(format!("{}.{}: type {u} is not generated; the column is left NULL", t.name, col.name));
+                found.warnings.push(format!("{}.{}: type {u} is not generated; the column is left NULL", t.name, col.name));
                 Strategy::Constant(Value::Null)
             } else if col.default.is_some() {
                 inserted = false;
                 Strategy::Skip
             } else {
-                problems.push(format!("{}.{}: type {u} is not supported and the column has no default", t.name, col.name));
+                found.problems.push(format!("{}.{}: type {u} is not supported and the column has no default", t.name, col.name));
                 Strategy::Skip
             }
         } else {
@@ -639,7 +708,7 @@ fn build_table(
                 }
                 Ok(_) => default_domain(&col.ty, &t.name, &col.name, window),
                 Err(e) => {
-                    problems.push(format!("columns.{}.{}: {e}", t.name, col.name));
+                    found.problems.push(format!("columns.{}.{}: {e}", t.name, col.name));
                     default_domain(&col.ty, &t.name, &col.name, window)
                 }
             };
@@ -664,7 +733,7 @@ fn build_table(
     for key in config.columns.keys() {
         if let Some((tn, cn)) = key.rsplit_once('.') {
             if tn == t.name && t.column(cn).is_none() {
-                problems.push(format!("columns.{key}: table {} has no column {cn}{}", t.name, suggest(cn, t.columns.iter().map(|c| c.name.as_str()))));
+                found.problems.push(format!("columns.{key}: table {} has no column {cn}{}", t.name, suggest(cn, t.columns.iter().map(|c| c.name.as_str()))));
             }
         }
     }
@@ -715,21 +784,21 @@ fn build_table(
         let Some(cfg) = config.column(&t.name, &col.name) else { continue };
         let Some(after) = &cfg.after else { continue };
         let Some(base) = t.column_index(after) else {
-            problems.push(format!("columns.{}.{}.after: no column {after}", t.name, col.name));
+            found.problems.push(format!("columns.{}.{}.after: no column {after}", t.name, col.name));
             continue;
         };
         let (min_gap, max_gap) = match &cfg.gap {
             Some([a, b]) => match (parse_duration(a), parse_duration(b)) {
                 (Ok(a), Ok(b)) => (a, b.max(a)),
                 (Err(e), _) | (_, Err(e)) => {
-                    problems.push(format!("columns.{}.{}.gap: {e}", t.name, col.name));
+                    found.problems.push(format!("columns.{}.{}.gap: {e}", t.name, col.name));
                     (US_PER_MIN, US_PER_HOUR)
                 }
             },
             None => (US_PER_MIN, (span / 20).max(US_PER_HOUR)),
         };
         if !col.ty.is_temporal() || !t.columns[base].ty.is_temporal() {
-            problems.push(format!("columns.{}.{}.after: both columns must be dates or timestamps", t.name, col.name));
+            found.problems.push(format!("columns.{}.{}.after: both columns must be dates or timestamps", t.name, col.name));
             continue;
         }
         set_after(&mut cols[ci], base, min_gap, max_gap);
@@ -811,7 +880,7 @@ fn build_table(
         }
         // Enumerate the combinations of finite parts.
         if parts.iter().any(Option::is_none) {
-            warnings.push(format!("table {}: {} has expression parts; dbgen cannot guarantee it is unique", t.name, key.name));
+            found.warnings.push(format!("table {}: {} has expression parts; dbgen cannot guarantee it is unique", t.name, key.name));
             continue;
         }
         let mut comps: Vec<(Component, Vec<usize>)> = Vec::new();
@@ -832,7 +901,7 @@ fn build_table(
             }
         }
         if !finite || comps.is_empty() {
-            warnings.push(format!("table {}: dbgen cannot guarantee that {} is unique", t.name, key.name));
+            found.warnings.push(format!("table {}: dbgen cannot guarantee that {} is unique", t.name, key.name));
             continue;
         }
         let radices: Vec<u64> = comps
@@ -845,7 +914,7 @@ fn build_table(
         let total = radices.iter().try_fold(1u128, |acc, &r| acc.checked_mul(r as u128));
         let combos = total.unwrap_or(u128::MAX);
         if (rows as u128) > combos {
-            problems.push(format!("table {}: {} rows requested, but {} allows only {combos} distinct combinations", t.name, rows, key.name));
+            found.problems.push(format!("table {}: {} rows requested, but {} allows only {combos} distinct combinations", t.name, rows, key.name));
             continue;
         }
         let key_idx = world.products.len();
@@ -877,7 +946,7 @@ fn build_table(
         if config.column(&t.name, &cols[c].name).and_then(|cc| cc.unique) == Some(true) && !matches!(cols[c].strategy, Strategy::Unique(_)) {
             match make_unique(&cols[c], rows, g.seed, table_tag, window) {
                 Some(u) => cols[c].strategy = Strategy::Unique(u),
-                None => problems.push(format!("columns.{}.{}: cannot make {} distinct values of {}", t.name, cols[c].name, rows, cols[c].ty)),
+                None => found.problems.push(format!("columns.{}.{}: cannot make {} distinct values of {}", t.name, cols[c].name, rows, cols[c].ty)),
             }
         }
     }
@@ -938,7 +1007,7 @@ fn build_table(
     let dependents = topo_order(&deps, cols.len());
     let insert: Vec<usize> = (0..cols.len()).filter(|&c| cols[c].inserted).collect();
     if insert.is_empty() {
-        problems.push(format!("table {}: no column to insert", t.name));
+        found.problems.push(format!("table {}: no column to insert", t.name));
     }
     TableGen {
         index: ti,
@@ -1119,6 +1188,7 @@ fn describe(col: &ColGen, world: &World, schema: &Schema, ti: usize) -> String {
                 Pick::Uniform => "",
                 Pick::Skewed { .. } => ", skewed",
                 Pick::Injective(_) => ", one-to-one",
+                Pick::Earlier => ", an earlier row",
                 Pick::Product { .. } => ", combinations without repeats",
             };
             format!("references {}.{}{how}", p.name, p.columns[r.parent_cols[*part]].name)
@@ -1231,8 +1301,9 @@ fn detect_cycles(world: &World, schema: &Schema, problems: &mut Vec<String>) {
     }
 }
 
-/// Generated tables, parents before children (cycles broken arbitrarily).
-fn load_order(world: &World, tables: &[TablePlan]) -> Vec<usize> {
+/// Generated tables by dependency level, parents before children (cycles broken
+/// arbitrarily).
+fn load_levels(world: &World, tables: &[TablePlan]) -> Vec<Vec<usize>> {
     let gen: Vec<usize> = (0..tables.len()).filter(|&i| matches!(tables[i].mode, Mode::Generate(_))).collect();
     let mut level: HashMap<usize, usize> = gen.iter().map(|&i| (i, 0)).collect();
     for _ in 0..gen.len() {
@@ -1252,9 +1323,16 @@ fn load_order(world: &World, tables: &[TablePlan]) -> Vec<usize> {
             break;
         }
     }
-    let mut order = gen;
-    order.sort_by_key(|i| (level[i], *i));
-    order
+    let mut levels: Vec<Vec<usize>> = Vec::new();
+    for ti in gen {
+        let l = level[&ti];
+        if levels.len() <= l {
+            levels.resize(l + 1, Vec::new());
+        }
+        levels[l].push(ti);
+    }
+    levels.retain(|l| !l.is_empty());
+    levels
 }
 
 /// Result of generating sample rows of each table.
@@ -1297,12 +1375,34 @@ pub fn sample(plan: &Plan, n: u64) -> Vec<SampleReport> {
 }
 
 impl Plan {
+    /// The generated tables, parents first, with their schema index.
     pub fn generated(&self) -> impl Iterator<Item = (usize, &TableGen)> {
         self.order.iter().map(|&i| (i, self.world.table(i)))
     }
 
+    /// Rows to generate across all tables.
     pub fn total_rows(&self) -> u64 {
         self.generated().map(|(_, t)| t.rows).sum()
+    }
+
+    /// Whether table `ti` has a column referencing the table itself.
+    pub fn references_itself(&self, ti: usize) -> bool {
+        self.world.relations.iter().any(|r| r.child == ti && r.parent == ti)
+    }
+
+    /// The generated tables that reference `ti`, directly or through other tables.
+    pub fn dependents(&self, ti: usize) -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::new();
+        let mut stack = vec![ti];
+        while let Some(t) = stack.pop() {
+            for r in &self.world.relations {
+                if r.parent == t && r.child != ti && !out.contains(&r.child) {
+                    out.push(r.child);
+                    stack.push(r.child);
+                }
+            }
+        }
+        out
     }
 
     /// Identifies the data this plan produces: same fingerprint, same rows.
@@ -1324,6 +1424,7 @@ impl Plan {
         format!("{:016x}", hash(&s.bytes().map(|b| b as u64).collect::<Vec<_>>()))
     }
 
+    /// The plan as text: window, table modes, relations, column strategies, warnings.
     pub fn render(&self, schema: &Schema) -> String {
         let mut s = String::new();
         let _ = writeln!(s, "Window: {} -> {}", Rfc3339(self.window.0), Rfc3339(self.window.1));

@@ -1,0 +1,27 @@
+# Blog: users, posts, threaded comments and tags. Shared by every dialect of this schema;
+# the tests add `database` and `schema`.
+generation:
+  seed: 47
+  batch_size: 4000
+  workers: 3
+  history_days: 400
+  end_time: "2026-01-01"
+
+tables:
+  users: 1000
+  posts: 5000
+  comments: 20000
+  tags: 100
+  post_tags: 12000
+
+# Names that do not reveal their parent table (ClickHouse has no foreign keys).
+relations:
+  - { from: "posts.author_id", to: "users.user_id", distribution: skewed, skew: 2.5 }
+  - "comments.parent_comment_id -> comments.comment_id"
+
+columns:
+  posts.status: { values: [draft, published, archived], weights: [2, 7, 1] }
+  posts.published_at: { after: created_at, gap: [5m, 3d] }
+  comments.user_id: { null_rate: 0.15 }
+  comments.parent_comment_id: { null_rate: 0.6 }
+  comments.body: { kind: sentence }

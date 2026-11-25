@@ -50,6 +50,7 @@ pub enum Strategy {
     Derived(CExpr),
 }
 
+/// What the CHECK solver may change in a column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mutability {
     /// The solver never changes it (keys, references that are not nullable...).
@@ -60,6 +61,7 @@ pub enum Mutability {
     Full,
 }
 
+/// How one column of a generated table gets its values.
 #[derive(Debug, Clone)]
 pub struct ColGen {
     pub name: String,
@@ -78,6 +80,7 @@ pub struct ColGen {
     pub describe: String,
 }
 
+/// A CHECK constraint the generator satisfies row by row.
 #[derive(Debug, Clone)]
 pub struct CheckGen {
     pub name: String,
@@ -87,6 +90,7 @@ pub struct CheckGen {
     pub movable: Vec<usize>,
 }
 
+/// The generator of one table: row `i` is a function of the seed and `i`.
 #[derive(Debug, Clone)]
 pub struct TableGen {
     pub index: usize,
@@ -111,6 +115,7 @@ pub struct ExistingRows {
     pub rows: Vec<Vec<Value>>,
 }
 
+/// How a child row chooses the parent row it references.
 #[derive(Debug, Clone)]
 pub enum Pick {
     Uniform,
@@ -118,10 +123,14 @@ pub enum Pick {
     Skewed { skew: f64, perm: Perm },
     /// One-to-one: child row `i` -> parent row `perm(i)`.
     Injective(Perm),
+    /// A row of the same table before the child row. Row 0 references itself when the
+    /// column cannot be NULL.
+    Earlier,
     /// Chosen by the enumeration of a composite key.
     Product { key: usize, comp: usize },
 }
 
+/// A relation between generated tables, or to rows read from the database.
 #[derive(Debug, Clone)]
 pub struct RelGen {
     pub child: usize,
@@ -133,6 +142,7 @@ pub struct RelGen {
     pub tag: u64,
 }
 
+/// One part of a composite key enumerated without repeats.
 #[derive(Debug, Clone)]
 pub enum Component {
     /// A relation: the component index is the parent row.
@@ -141,6 +151,8 @@ pub enum Component {
     Values(Vec<Value>),
 }
 
+/// A composite key whose combinations are enumerated without repeats: row `i` takes
+/// combination `perm(i)`, read as a mixed-radix number.
 #[derive(Debug, Clone)]
 pub struct ProductGen {
     pub perm: Perm,
@@ -173,6 +185,7 @@ pub struct Row {
 }
 
 impl Row {
+    /// An empty row, reused across rows to save allocations.
     pub fn new() -> Row {
         Row { values: Vec::new(), state: Vec::new() }
     }
@@ -184,6 +197,7 @@ impl Default for Row {
     }
 }
 
+/// A row whose CHECKs could not be satisfied, with its last attempt.
 #[derive(Debug, Clone)]
 pub struct RowError {
     pub table: String,
@@ -206,6 +220,7 @@ impl fmt::Display for RowError {
 }
 
 impl World {
+    /// The generator of table `index`, which must be generated.
     pub fn table(&self, index: usize) -> &TableGen {
         self.tables[index].as_ref().expect("generated table")
     }
@@ -220,6 +235,8 @@ impl World {
                 perm.apply(k.min(n - 1))
             }
             Pick::Injective(perm) => perm.apply(i % n),
+            Pick::Earlier if i == 0 => 0,
+            Pick::Earlier => Rng::at(&[self.seed, rel.tag, i, PICK_STREAM]).below(i.min(n)),
             Pick::Product { key, comp } => self.product_index(*key, *comp, i),
         }
     }
@@ -273,10 +290,13 @@ impl TableGen {
             Strategy::Constant(v) => v.clone(),
             Strategy::Unique(u) => u.value(i),
             Strategy::Ref { rel, part } => {
-                if c.nullable && is_null() {
+                let r = &w.relations[*rel];
+                // The first row of a table that references itself has no earlier row: it
+                // is a root of the hierarchy, unless the column cannot be NULL.
+                let root = i == 0 && matches!(r.pick, Pick::Earlier);
+                if c.nullable && (root || is_null()) {
                     return Value::Null;
                 }
-                let r = &w.relations[*rel];
                 w.parent_value(r, w.parent_row(r, i), *part)
             }
             Strategy::Product { key, comp, part } => {

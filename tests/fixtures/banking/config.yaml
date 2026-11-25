@@ -1,0 +1,23 @@
+# Banking: branches, customers, accounts and a ledger of transactions. Shared by every
+# dialect of this schema; the tests add `database` and `schema`.
+generation:
+  seed: 59
+  batch_size: 5000
+  workers: 4
+  history_days: 365
+  end_time: "2026-01-01"
+
+tables:
+  currencies: existing
+  branches: 40
+  customers: 3000
+  accounts: 5000
+  transactions: 50000
+
+columns:
+  customers.risk_level: { values: [low, medium, high], weights: [70, 25, 5] }
+  accounts.balance: { range: [-5000, 250000] }
+  accounts.overdraft_limit: { values: [0, 1000, 2500, 5000] }
+  accounts.closed_on: { null_rate: 0.9 }
+  transactions.amount: { range: [-5000, 5000] }
+  transactions.counterparty_account_id: { null_rate: 0.4 }

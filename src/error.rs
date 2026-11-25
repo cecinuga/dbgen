@@ -1,6 +1,7 @@
 //! Failure classes. Each maps to a distinct process exit code (see `main.rs`), so a script
 //! driving a series of loads can tell a bad config from a failed load.
 
+/// Why a command failed.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("configuration error: {0}")]
@@ -24,9 +25,12 @@ pub enum Error {
     Interrupted,
 }
 
+/// The result of a command step.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl Error {
+    /// The process exit code: 2 for configuration, 3 for connection, 1 for load or
+    /// verification, 130 for an interrupt.
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::Config(_) | Error::Schema(_) | Error::Validation(_) => 2,

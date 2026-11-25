@@ -1,13 +1,14 @@
 //! Column data types, dialect-neutral.
 //!
-//! A dialect maps its type syntax onto these (see `dialect::*`), and a database backend
-//! maps them onto its wire format. The variants follow the richest type system supported
-//! so far (ClickHouse); simpler systems map onto a subset.
+//! A connector maps its type syntax onto these (`Connector::parse_type`, `TypeRules`),
+//! and its backend maps them onto its wire format. The variants follow the richest type
+//! system supported so far (ClickHouse); simpler systems map onto a subset.
 
 use std::fmt;
 
 use serde::Serialize;
 
+/// A column type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DataType {
@@ -82,6 +83,7 @@ impl DataType {
         matches!(self.base(), DataType::String { .. } | DataType::FixedString(_))
     }
 
+    /// Whether the type is or contains `JSON`.
     pub fn contains_json(&self) -> bool {
         match self {
             DataType::Json => true,
@@ -92,6 +94,7 @@ impl DataType {
         }
     }
 
+    /// The part of the type dbgen cannot generate, if any.
     pub fn unsupported(&self) -> Option<&str> {
         match self {
             DataType::Unsupported(s) => Some(s),
@@ -124,6 +127,7 @@ impl DataType {
     }
 }
 
+/// Inclusive range of an integer of `bits` bits, clamped to `i128`.
 pub fn int_range(bits: u16, signed: bool) -> (i128, i128) {
     match (bits, signed) {
         (b, true) if b < 128 => (-(1i128 << (b - 1)), (1i128 << (b - 1)) - 1),

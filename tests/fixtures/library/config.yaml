@@ -1,0 +1,22 @@
+# Library: books, authors, members and loans. Shared by every dialect of this schema;
+# the tests add `database` and `schema`.
+generation:
+  seed: 11
+  batch_size: 2000
+  workers: 3
+  history_days: 365
+  end_time: "2026-01-01"
+
+tables:
+  genres: existing
+  publishers: 50
+  authors: 500
+  books: 3000
+  book_authors: 6000
+  members: 1000
+  loans: 10000
+
+columns:
+  books.price: { range: [5, 120] }
+  loans.due_at: { after: loaned_at, gap: [7d, 30d] }
+  loans.returned_at: { after: loaned_at, gap: [1h, 45d], null_rate: 0.2 }

@@ -9,6 +9,7 @@ use crate::db::Database;
 use crate::plan::Plan;
 use crate::schema::{KeyPart, Schema};
 
+/// The outcome of one check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CheckStatus {
@@ -18,6 +19,7 @@ pub enum CheckStatus {
     Error,
 }
 
+/// One verification check and what it found.
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckResult {
     pub name: String,
@@ -34,6 +36,7 @@ fn counted(name: String, sql: &str, db: &Database, what: &str) -> CheckResult {
     }
 }
 
+/// Runs every check on the generated tables. Checks on empty tables are skipped.
 pub fn run(db: &Database, schema: &Schema, plan: &Plan) -> Vec<CheckResult> {
     let mut out = Vec::new();
     let mut counts = std::collections::HashMap::new();
@@ -95,6 +98,7 @@ pub fn run(db: &Database, schema: &Schema, plan: &Plan) -> Vec<CheckResult> {
     out
 }
 
+/// The results as text, with totals.
 pub fn render(results: &[CheckResult]) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "\nVERIFICATION\n");
@@ -113,6 +117,7 @@ pub fn render(results: &[CheckResult]) -> String {
     s
 }
 
+/// Whether no check failed or errored.
 pub fn all_passed(results: &[CheckResult]) -> bool {
     results.iter().all(|r| matches!(r.status, CheckStatus::Pass | CheckStatus::Skip))
 }

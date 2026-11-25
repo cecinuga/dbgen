@@ -1,5 +1,5 @@
-//! ClickHouse: the adapter that drives `sqlparser` over ClickHouse DDL, and the semantics
-//! of ClickHouse table engines.
+//! The ClickHouse dialect: the adapter that drives `sqlparser` over ClickHouse DDL, the
+//! ClickHouse type names, and the semantics of ClickHouse table engines.
 //!
 //! `sqlparser` parses ClickHouse types, column definitions and expressions, but not the
 //! structure of ClickHouse `CREATE TABLE` and `ALTER TABLE` statements: table clauses
@@ -10,28 +10,70 @@
 
 use std::ops::Range;
 
-use sqlparser::ast::{Expr, Function, FunctionArguments};
+use sqlparser::ast::{Expr, Function, FunctionArguments, TypeModifier};
 use sqlparser::dialect::ClickHouseDialect;
 use sqlparser::tokenizer::{Token, TokenWithSpan};
 
 use crate::schema::{DataType, Key, KeyKind, KeyPart};
-use crate::sql::convert::{self, Constraint, TypeRules};
+use crate::sql::convert::{self, TypeRules};
 use crate::sql::{
     are_kws, is_kw, matching, parse_slice, parse_tokens, read_name, split_commas, string_lit, top_level_positions, word, AlterAction,
     CheckSpec, ColumnPosition, ColumnSpec, Ddl, DefaultKind, DefaultSpec, Diag, EngineSpec, ExprSpec, Statement, TableDef,
 };
 
-use super::TableSemantics;
+use crate::connector::TableSemantics;
 
+/// The `sqlparser` dialect used for ClickHouse statements.
 pub static DIALECT: ClickHouseDialect = ClickHouseDialect {};
 
+/// How ClickHouse reads type spellings.
 pub const RULES: TypeRules = TypeRules {
     int8_is_8_bits: true,
     nullable_by_default: false,
     varchar_has_length: false,
     date_is_16_bit: true,
     timestamp_is_seconds: true,
+    timestamp_precision: 6,
+    custom_type,
+    identity_types: &[],
 };
+
+/// ClickHouse types that `sqlparser` reads as custom names.
+fn custom_type(name: &str, mods: &[TypeModifier], rules: &TypeRules) -> Option<DataType> {
+    let number = |i: usize| match mods.get(i) {
+        Some(TypeModifier::Number(n, _)) => n.parse::<u8>().ok(),
+        _ => None,
+    };
+    let point = || DataType::Tuple(vec![(None, DataType::Float { bits: 64 }), (None, DataType::Float { bits: 64 })]);
+    let ring = || DataType::Array(Box::new(point()));
+    let polygon = || DataType::Array(Box::new(ring()));
+    Some(match name {
+        "IPv4" => DataType::Ipv4,
+        "IPv6" => DataType::Ipv6,
+        "Decimal32" => DataType::Decimal { precision: 9, scale: number(0)? },
+        "Decimal64" => DataType::Decimal { precision: 18, scale: number(0)? },
+        "Decimal128" => DataType::Decimal { precision: 38, scale: number(0)? },
+        "Decimal256" => DataType::Decimal { precision: 76, scale: number(0)? },
+        "Object" => DataType::Json,
+        "Point" => point(),
+        "Ring" | "LineString" => ring(),
+        "Polygon" | "MultiLineString" => polygon(),
+        "MultiPolygon" => DataType::Array(Box::new(polygon())),
+        // SimpleAggregateFunction(f, T) stores plain T values.
+        "SimpleAggregateFunction" => match mods.get(1) {
+            Some(TypeModifier::Identifier(id)) => parse_type_name(&id.value, rules)?,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// Parses a bare type name, for types nested in modifiers (`SimpleAggregateFunction`).
+pub fn parse_type_name(name: &str, rules: &TypeRules) -> Option<DataType> {
+    let mut parser = sqlparser::parser::Parser::new(&DIALECT).try_with_sql(name).ok()?;
+    let t = parser.parse_data_type().ok()?;
+    Some(convert::data_type(&t, rules))
+}
 
 /// Column-definition keywords that end a type or a `TTL` expression.
 const COLUMN_OPTION_KEYWORDS: &[&str] = &[
@@ -39,6 +81,7 @@ const COLUMN_OPTION_KEYWORDS: &[&str] = &[
     "FIRST", "AFTER", "REMOVE", "MODIFY", "RESET",
 ];
 
+/// Reduces one ClickHouse statement to its effect on the schema.
 pub fn parse_statement(stmt: &Statement) -> Result<Ddl, Diag> {
     let t = &stmt.toks;
     if is_kw(t.first(), "CREATE") {
@@ -110,6 +153,7 @@ fn skip_on_cluster(t: &[TokenWithSpan], i: usize) -> usize {
     }
 }
 
+/// Parses tokens `range` of `stmt` as an expression, keeping its source text.
 pub fn expr_at(stmt: &Statement, range: Range<usize>, what: &str) -> Result<ExprSpec, Diag> {
     let sql = stmt.slice_text(range.clone());
     let expr = parse_slice(stmt, range, &DIALECT, what, |p| p.parse_expr())?;
@@ -180,38 +224,16 @@ fn elements(stmt: &Statement, range: Range<usize>, def: &mut TableDef) -> Result
         }
         let (columns, _) = column(stmt, r, false)?;
         for c in columns {
-            add_column_spec(def, c);
+            def.add_column(c);
         }
     }
     Ok(())
 }
 
-fn add_column_spec(def: &mut TableDef, mut c: ColumnSpec) {
-    if let Some(check) = c.check.take() {
-        def.checks.push(check);
-    }
-    if let Some(fk) = c.references.take() {
-        def.foreign_keys.push(fk);
-    }
-    if c.primary_key {
-        def.primary_key = Some(vec![c.name.clone()]);
-    }
-    if c.unique {
-        def.uniques.push(vec![c.name.clone()]);
-    }
-    def.columns.push(c);
-}
-
 fn standard_constraint(stmt: &Statement, r: Range<usize>, def: &mut TableDef) -> Result<(), Diag> {
     let c = parse_slice(stmt, r.clone(), &DIALECT, "table constraint", |p| p.parse_optional_table_constraint())?
         .ok_or_else(|| expected(stmt, r.start, "a table constraint"))?;
-    match convert::table_constraint(stmt, c) {
-        Constraint::Check(c) => def.checks.push(c),
-        Constraint::PrimaryKey(cols) => def.primary_key = Some(cols),
-        Constraint::Unique(cols) => def.uniques.push(cols),
-        Constraint::ForeignKey(fk) => def.foreign_keys.push(fk),
-        Constraint::Other => {}
-    }
+    def.add_constraint(convert::table_constraint(stmt, c));
     Ok(())
 }
 

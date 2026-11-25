@@ -30,6 +30,7 @@ impl Write for LogWriter {
     }
 }
 
+/// The progress display, running on its own thread until [`Progress::stop`].
 pub struct Progress {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -51,6 +52,7 @@ impl Progress {
         Progress { stop, thread: Some(thread) }
     }
 
+    /// Stops the display and waits for its last update.
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(t) = self.thread.take() {

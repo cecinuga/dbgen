@@ -1,0 +1,27 @@
+# The shop schema in clickhouse, loaded with synthetic data.
+#
+#   docker compose up -d clickhouse
+#   bin/dbgen apply    -c examples/shop/clickhouse.yaml --create-database
+#   bin/dbgen generate -c examples/shop/clickhouse.yaml --verify
+database: "http://dbgen:dbgen@localhost:18123/shop"
+schema: ../../tests/fixtures/shop.sql
+
+generation:
+  seed: 7
+  history_days: 90
+  end_time: "2026-01-01"
+
+tables:
+  customers: 2000
+  products: 300
+  orders: 20000
+  order_lines: 50000
+  countries: existing
+
+# ClickHouse has no foreign keys: references the column names do not reveal are declared.
+relations:
+  - "customers.country_code -> countries.code"
+
+columns:
+  orders.channel: { values: [store, web, app], weights: [2, 5, 3] }
+  orders.status: { values: [new, paid, shipped, cancelled], weights: [1, 3, 5, 1] }

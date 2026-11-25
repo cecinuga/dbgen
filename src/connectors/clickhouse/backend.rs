@@ -1,5 +1,5 @@
-//! ClickHouse over its HTTP interface: queries as text, inserts and reads in `RowBinary`,
-//! encoded from the column types of the compiled schema.
+//! The ClickHouse backend, over the HTTP interface: queries as text, inserts and reads in
+//! `RowBinary`, encoded from the column types of the compiled schema.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -8,8 +8,11 @@ use crate::error::{Error, Result};
 use crate::schema::{DataType, Table};
 use crate::value::{parse_uuid, Num, Value};
 
-use super::DbError;
+use crate::connector::Dialect;
+use crate::db::{file_safe, Backend, Batch, CellError, DbError, DbErrorKind, DbResult, LiveColumns, RowRef, TextRows};
 
+/// A ClickHouse database, over the HTTP interface. Requests are independent, so the
+/// client is shared by every thread.
 #[derive(Debug, Clone)]
 pub struct Client {
     agent: ureq::Agent,
@@ -87,10 +90,6 @@ impl Client {
         Ok(Client { agent, base, user, password, database, host, port })
     }
 
-    pub fn describe(&self) -> String {
-        format!("clickhouse {}:{}/{}", self.host, self.port, self.database)
-    }
-
     fn post(&self, params: &[(&str, &str)], body: &[u8]) -> std::result::Result<Vec<u8>, DbError> {
         let mut url = self.base.clone();
         url.push_str("?database=");
@@ -111,13 +110,21 @@ impl Client {
             Err(ureq::Error::Status(status, resp)) => {
                 let text = resp.into_string().unwrap_or_default();
                 let code = text.strip_prefix("Code: ").and_then(|r| r.split('.').next()).and_then(|c| c.trim().parse::<u32>().ok());
-                let transient = status == 503 || code.is_some_and(|c| TRANSIENT_CODES.contains(&c));
-                let message = text.trim().lines().next().unwrap_or("").to_string();
-                Err(DbError { message: format!("HTTP {status}: {message}"), transient, connect: false })
+                let kind = match code {
+                    Some(81) => DbErrorKind::UnknownDatabase,
+                    Some(c) if TRANSIENT_CODES.contains(&c) => DbErrorKind::Transient,
+                    _ if status == 503 => DbErrorKind::Transient,
+                    _ => DbErrorKind::Failed,
+                };
+                let message = text.trim().lines().next().unwrap_or("");
+                Err(DbError::new(kind, format!("HTTP {status}: {message}")))
             }
             Err(ureq::Error::Transport(t)) => {
-                let connect = matches!(t.kind(), ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns);
-                Err(DbError { message: t.to_string(), transient: true, connect })
+                let kind = match t.kind() {
+                    ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns => DbErrorKind::Unreachable,
+                    _ => DbErrorKind::Transient,
+                };
+                Err(DbError::new(kind, t.to_string()))
             }
         }
     }
@@ -127,32 +134,34 @@ impl Client {
         self.post(&[], sql.as_bytes())
     }
 
+    /// The response as text.
     pub fn query_text(&self, sql: &str) -> std::result::Result<String, DbError> {
         self.post(&[], sql.as_bytes()).map(|b| String::from_utf8_lossy(&b).into_owned())
     }
 
+    /// Runs a statement, discarding the response.
     pub fn execute(&self, sql: &str) -> std::result::Result<(), DbError> {
         self.post(&[], sql.as_bytes()).map(|_| ())
     }
 
+    /// Quotes an identifier with backticks.
     pub fn quote(name: &str) -> String {
         format!("`{}`", name.replace('\\', "\\\\").replace('`', "\\`"))
     }
 
+    /// `database`.`table`.
     pub fn qualified(&self, table: &str) -> String {
         format!("{}.{}", Client::quote(&self.database), Client::quote(table))
     }
 
+    /// The server version.
     pub fn version(&self) -> std::result::Result<String, DbError> {
         self.query_text("SELECT version() FORMAT TSVRaw").map(|s| s.trim().to_string())
     }
 
     /// Table -> its columns and types, as the server reports them.
     pub fn live_columns(&self) -> std::result::Result<HashMap<String, Vec<(String, String)>>, DbError> {
-        let sql = format!(
-            "SELECT table, name, type FROM system.columns WHERE database = '{}' ORDER BY table, position FORMAT TSVRaw",
-            self.database.replace('\\', "\\\\").replace('\'', "\\'")
-        );
+        let sql = format!("SELECT table, name, type FROM system.columns WHERE database = {} ORDER BY table, position FORMAT TSVRaw", string_literal(&self.database));
         let mut out: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for line in self.query_text(&sql)?.lines() {
             let mut parts = line.splitn(3, '\t');
@@ -163,20 +172,14 @@ impl Client {
         Ok(out)
     }
 
+    /// Runs a query returning one non-negative integer.
     pub fn query_u64(&self, sql: &str) -> std::result::Result<u64, DbError> {
         let text = self.query_text(&format!("{sql} FORMAT TSVRaw"))?;
-        text.trim().parse().map_err(|_| DbError { message: format!("unexpected result '{}' for: {sql}", text.trim()), transient: false, connect: false })
+        text.trim().parse().map_err(|_| DbError::failed(format!("unexpected result '{}' for: {sql}", text.trim())))
     }
 
-    pub fn count(&self, table: &str) -> std::result::Result<u64, DbError> {
-        self.query_u64(&format!("SELECT count() FROM {}", self.qualified(table)))
-    }
-
-    pub fn truncate(&self, table: &str) -> std::result::Result<(), DbError> {
-        self.execute(&format!("TRUNCATE TABLE {} SYNC", self.qualified(table)))
-    }
-
-    pub fn insert(&self, table: &str, columns: &[&str], body: &[u8], json_as_string: bool) -> std::result::Result<(), DbError> {
+    /// Inserts rows encoded in RowBinary. `json_as_string`: JSON columns are sent as text.
+    pub fn insert_rows(&self, table: &str, columns: &[&str], body: &[u8], json_as_string: bool) -> std::result::Result<(), DbError> {
         let cols: Vec<String> = columns.iter().map(|c| Client::quote(c)).collect();
         let query = format!("INSERT INTO {} ({}) FORMAT RowBinary", self.qualified(table), cols.join(", "));
         let mut params: Vec<(&str, &str)> = vec![("query", &query), ("async_insert", "0")];
@@ -206,12 +209,143 @@ impl Client {
         while cur.pos < bytes.len() {
             let mut row = Vec::with_capacity(types.len());
             for t in &types {
-                row.push(decode(&mut cur, t).map_err(|m| DbError { message: format!("decoding {}: {m}", table.name), transient: false, connect: false })?);
+                row.push(decode(&mut cur, t).map_err(|m| DbError::failed(format!("decoding {}: {m}", table.name)))?);
             }
             rows.push(row);
         }
         Ok(rows)
     }
+}
+
+impl Backend for Client {
+    fn dialect(&self) -> Dialect {
+        super::CONNECTOR
+    }
+
+    fn describe(&self) -> String {
+        format!("clickhouse {}:{}/{}", self.host, self.port, self.database)
+    }
+
+    fn state_key(&self) -> String {
+        file_safe(&format!("{}_{}_{}", self.host, self.port, self.database))
+    }
+
+    fn version(&self) -> DbResult<String> {
+        Client::version(self)
+    }
+
+    fn create_database(&self) -> DbResult<()> {
+        let admin = Client { database: "default".into(), ..self.clone() };
+        admin.execute(&format!("CREATE DATABASE IF NOT EXISTS {}", Client::quote(&self.database)))
+    }
+
+    fn execute(&self, sql: &str) -> DbResult<()> {
+        Client::execute(self, sql)
+    }
+
+    fn query_rows(&self, sql: &str) -> DbResult<TextRows> {
+        let text = self.query_text(&format!("{sql} FORMAT TabSeparated"))?;
+        Ok(text.lines().map(|line| line.split('\t').map(tsv_field).collect()).collect())
+    }
+
+    fn live_columns(&self) -> DbResult<LiveColumns> {
+        Client::live_columns(self)
+    }
+
+    fn encode_row(&self, out: &mut Vec<u8>, row: &RowRef<'_>) -> std::result::Result<(), CellError> {
+        row.cells().try_for_each(|(k, ty, v)| encode(out, ty, v).map_err(|message| CellError { column: k, message }))
+    }
+
+    fn insert(&self, table: &Table, columns: &[&str], batch: &Batch) -> DbResult<()> {
+        let json = table.columns.iter().any(|col| col.ty.contains_json() && columns.contains(&col.name.as_str()));
+        self.insert_rows(&table.name, columns, &batch.body, json)
+    }
+
+    fn truncate(&self, tables: &[&str]) -> DbResult<()> {
+        tables.iter().try_for_each(|t| Client::execute(self, &format!("TRUNCATE TABLE {} SYNC", self.qualified(t))))
+    }
+
+    fn strict_types(&self) -> bool {
+        true
+    }
+
+    /// The `CREATE` statements ClickHouse keeps in `system.tables.create_table_query`:
+    /// tables first, then views and materialized views (whose `TO` target survives, so
+    /// `derived_by` does). The hidden `.inner` tables of materialized views without `TO`,
+    /// dictionaries and temporary tables are left out.
+    fn introspect_ddl(&self) -> DbResult<String> {
+        let sql = format!(
+            "SELECT create_table_query FROM system.tables
+             WHERE database = {} AND NOT is_temporary AND name NOT LIKE '.inner%' AND engine != 'Dictionary' AND create_table_query != ''
+             ORDER BY engine IN ('View', 'MaterializedView', 'LiveView', 'WindowView'), name",
+            string_literal(&self.database)
+        );
+        let rows = self.query_rows(&sql)?;
+        Ok(rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).map(|q| format!("{};\n\n", q.trim_end())).collect())
+    }
+
+    fn quote(&self, ident: &str) -> String {
+        Client::quote(ident)
+    }
+
+    fn table_ref(&self, table: &str) -> String {
+        self.qualified(table)
+    }
+
+    fn query_u64(&self, sql: &str) -> DbResult<u64> {
+        Client::query_u64(self, sql)
+    }
+
+    fn read_rows(&self, table: &Table, columns: &[usize], limit: u64) -> DbResult<Vec<Vec<Value>>> {
+        Client::read_rows(self, table, columns, limit)
+    }
+
+    fn duplicates_sql(&self, table: &Table, key: &[String]) -> String {
+        Client::duplicates_sql(self, table, key)
+    }
+
+    fn collapsed_sql(&self, table: &Table) -> Option<String> {
+        table.collapsing.then(|| Client::collapsed_sql(self, table))
+    }
+
+    fn orphans_sql(&self, child: &Table, child_cols: &[&str], parent: &Table, parent_cols: &[&str]) -> String {
+        Client::orphans_sql(self, child, child_cols, parent, parent_cols)
+    }
+
+    fn violations_sql(&self, table: &Table, check_sql: &str) -> String {
+        Client::violations_sql(self, table, check_sql)
+    }
+}
+
+/// A ClickHouse string literal.
+fn string_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// One field of `TabSeparated` output: `\N` is NULL, backslash escapes are undone.
+fn tsv_field(s: &str) -> Option<String> {
+    if s == "\\N" {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('0') => out.push('\0'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    Some(out)
 }
 
 fn percent_decode(s: &str) -> String {
@@ -578,6 +712,7 @@ impl Client {
         )
     }
 
+    /// Rows that violate a CHECK constraint.
     pub fn violations_sql(&self, table: &Table, check_sql: &str) -> String {
         format!("SELECT count() FROM {} WHERE NOT ({check_sql})", self.qualified(&table.name))
     }

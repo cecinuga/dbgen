@@ -11,6 +11,7 @@ use crate::value::{format_uuid, Num, Value};
 use super::perm::Perm;
 use super::words::*;
 
+/// What a text column holds, which decides how its values look.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TextKind {
     FirstName,
@@ -128,6 +129,8 @@ impl TextKind {
         TextKind::Word
     }
 
+    /// A random value of this kind. With `pool`, values come from that many distinct
+    /// ones (low-cardinality columns).
     pub fn render(&self, rng: &mut Rng, pool: Option<u32>) -> String {
         match self {
             TextKind::FirstName => rng.pick(FIRST_NAMES).to_string(),
@@ -225,6 +228,7 @@ pub fn table_stem(table: &str) -> String {
     singular(&t).replace('_', " ")
 }
 
+/// A table name without its warehouse prefix: `dim_staff` -> `staff`.
 pub fn strip_table_prefix(t: &str) -> String {
     for p in ["dim_", "fact_", "fct_", "d_", "f_", "tbl_", "t_", "ref_", "lkp_", "lookup_", "stg_"] {
         if let Some(rest) = t.strip_prefix(p) {
@@ -236,6 +240,7 @@ pub fn strip_table_prefix(t: &str) -> String {
     t.to_string()
 }
 
+/// The English singular of a plural noun, as far as table names need it.
 pub fn singular(s: &str) -> String {
     if let Some(stem) = s.strip_suffix("ies") {
         return format!("{stem}y");
@@ -268,6 +273,7 @@ pub fn truncate_time(us: i64, precision: Option<u8>) -> i64 {
     us - us.rem_euclid(unit)
 }
 
+/// Values distinct for every row index, by construction.
 #[derive(Debug, Clone)]
 pub enum Unique {
     Int { start: i128, step: i128 },
@@ -284,6 +290,7 @@ pub enum Unique {
 }
 
 impl Unique {
+    /// The value of row `i`.
     pub fn value(&self, i: u64) -> Value {
         match self {
             Unique::Int { start, step } => Value::Int(start + step * i as i128),
@@ -351,6 +358,7 @@ pub enum Domain {
     Null,
 }
 
+/// The domain of the elements of an array, map or tuple.
 #[derive(Debug, Clone)]
 pub struct Elem {
     pub domain: Domain,
@@ -358,6 +366,7 @@ pub struct Elem {
 }
 
 impl Domain {
+    /// A domain drawing from `values`, in proportion to `weights` (equal by default).
     pub fn values(values: Vec<Value>, weights: Option<&[u32]>) -> Domain {
         let mut cumulative = Vec::with_capacity(values.len());
         let mut total = 0u64;
@@ -368,6 +377,7 @@ impl Domain {
         Domain::Values { values, cumulative }
     }
 
+    /// A value for row `i`, drawn from `rng`.
     pub fn sample(&self, rng: &mut Rng, i: u64) -> Value {
         match self {
             Domain::Values { values, cumulative } => {
@@ -547,6 +557,7 @@ fn apply_bounds(lo: &mut i128, hi: &mut i128, new_lo: Option<i128>, new_hi: Opti
 }
 
 impl Elem {
+    /// A value for row `i`, drawn from `rng`.
     pub fn sample(&self, rng: &mut Rng, i: u64) -> Value {
         if self.null_rate > 0.0 && rng.chance(self.null_rate) {
             return Value::Null;

@@ -1,0 +1,23 @@
+# The shop schema in postgres, loaded with synthetic data.
+#
+#   docker compose up -d postgres
+#   bin/dbgen apply    -c examples/shop/postgres.yaml --create-database
+#   bin/dbgen generate -c examples/shop/postgres.yaml --verify
+database: "postgres://dbgen:dbgen@localhost:15432/shop"
+schema: ../../tests/fixtures/shop.postgres.sql
+
+generation:
+  seed: 7
+  history_days: 90
+  end_time: "2026-01-01"
+
+tables:
+  categories: 40
+  customers: 2000
+  products: 300
+  orders: 20000
+  order_lines: 50000
+  countries: existing
+
+columns:
+  orders.channel: { values: [store, web, app], weights: [2, 5, 3] }
