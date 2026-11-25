@@ -341,7 +341,7 @@ fn function(name: &str, mut args: Vec<CExpr>) -> Result<CExpr, String> {
         // ClickHouse stores `CASE x WHEN v THEN r ... ELSE e END` as
         // caseWithExpression(x, v, r, ..., e): compiled back to the CASE it was, so the
         // solver analyses it the same way.
-        "casewithexpression" if n >= 4 && n % 2 == 0 => {
+        "casewithexpression" if n >= 4 && n.is_multiple_of(2) => {
             let otherwise = args.pop().map(b);
             let mut rest = args.into_iter();
             let operand = rest.next().map(b);
@@ -918,11 +918,10 @@ impl CExpr {
             CExpr::In(x, items, _) => {
                 if let CExpr::Col(c) = &**x {
                     for i in items {
-                        if let CExpr::Lit(v) = i {
-                            if !v.is_null() {
+                        if let CExpr::Lit(v) = i
+                            && !v.is_null() {
                                 out.push((*c, v.clone()));
                             }
-                        }
                     }
                 }
             }
@@ -981,11 +980,10 @@ impl CExpr {
         let CExpr::Cmp(CmpOp::Eq, l, r) = self else { return vec![] };
         let mut out = Vec::new();
         for (side, other) in [(&**l, &**r), (&**r, &**l)] {
-            if let CExpr::Col(c) = side {
-                if !other.references(*c) {
+            if let CExpr::Col(c) = side
+                && !other.references(*c) {
                     out.push((*c, other.clone()));
                 }
-            }
             // Linear isolation over a sum of signed terms.
             let mut terms = Vec::new();
             if flatten_sum(side, true, &mut terms) && terms.len() >= 2 {
@@ -1034,13 +1032,11 @@ impl CExpr {
         match self {
             CExpr::Or(l, r) => {
                 for (x, y) in [(&**l, &**r), (&**r, &**l)] {
-                    if let CExpr::IsNull(n, false) = x {
-                        if let (CExpr::Col(nc), Some(o)) = (&**n, cmp(y)) {
-                            if *nc == o.0 || *nc == o.1 {
+                    if let CExpr::IsNull(n, false) = x
+                        && let (CExpr::Col(nc), Some(o)) = (&**n, cmp(y))
+                            && (*nc == o.0 || *nc == o.1) {
                                 return Some(o);
                             }
-                        }
-                    }
                 }
                 None
             }

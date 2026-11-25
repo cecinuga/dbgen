@@ -456,11 +456,10 @@ impl Schema {
             }
             for key in &t.keys {
                 for part in &key.parts {
-                    if let KeyPart::Column(c) = part {
-                        if !t.columns.iter().any(|col| &col.name == c) {
+                    if let KeyPart::Column(c) = part
+                        && !t.columns.iter().any(|col| &col.name == c) {
                             self.warnings.push(format!("table {}: {} names column {c}, which does not exist", t.name, key.name));
                         }
-                    }
                 }
             }
         }

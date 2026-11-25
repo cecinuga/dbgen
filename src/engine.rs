@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::db::{Batch, Database, RowRef};
 use crate::error::{Error, Result};
-use crate::gen::Row;
+use crate::generator::Row;
 use crate::plan::Plan;
 use crate::schema::{DataType, Schema};
 use crate::state::State;

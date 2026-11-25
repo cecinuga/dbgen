@@ -1,0 +1,7 @@
+# The Rust release dbgen is built and tested with. rustup installs it automatically;
+# scripts/cargo-docker.sh and the Dockerfile use the official image of the same release.
+# clippy and rustfmt are not listed, so builds in throwaway containers do not download
+# them every time: `rustup component add clippy rustfmt` adds them on a workstation.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"

@@ -20,11 +20,11 @@ The main use is the Agevola reporting DWH on ClickHouse ([examples/agevola/](exa
 
 ## Quick start
 
-No Rust toolchain is needed on the host: the wrapper script builds inside the official Rust image. SQLite needs
-no server, so it is the shortest way to try dbgen.
+No Rust toolchain is needed on the host: without Rust 1.100, `make` builds inside the official Rust image. SQLite
+needs no server, so it is the shortest way to try dbgen.
 
 ```bash
-scripts/cargo-docker.sh build --release                              # binary at bin/dbgen
+make release                                                         # optimized binary at bin/dbgen
 
 bin/dbgen inspect  -c examples/shop/sqlite.yaml                      # schema and plan, no database needed
 bin/dbgen apply    -c examples/shop/sqlite.yaml --create-database    # create the database and run the DDL
@@ -43,13 +43,30 @@ bin/dbgen generate -d postgres://dbgen:dbgen@localhost:15432/shop --default-rows
 bin/dbgen init     -d postgres://dbgen:dbgen@localhost:15432/shop -o dbgen.yaml     # or start a configuration
 ```
 
-Other ways to build:
+`make help` lists every task. The main ones:
 
-- With a local toolchain (Rust 1.85 or later), `cargo build --release` puts the binary at `target/release/dbgen`.
-  SQLite is compiled in, and nothing else needs a system library.
-- `docker build -t dbgen .` builds a self-contained image. Run it with
-  `docker run --rm --network host -v "$PWD:/work" -w /work dbgen generate -c dbgen.yaml`. The configuration's
-  `schema` paths must be inside the mounted directory.
+| Target | What it does |
+|---|---|
+| `make build`, `make release` | Debug build; optimized build (opt-level 3, thin LTO, one codegen unit) to `bin/dbgen` |
+| `make release-native` | Optimized for this machine's CPU: faster, but may not run on other CPUs |
+| `make test`, `make test-all` | Tests that need no server; every test, starting the test servers first |
+| `make lint`, `make doc` | Clippy and the API documentation, warnings as errors |
+| `make analyze`, `make security` | Every code analyzer; every security scanner (see [Code quality and security](#code-quality-and-security)) |
+| `make image`, `make install` | Docker image; install `bin/dbgen` into `~/.local/bin` |
+
+dbgen is built with Rust 1.100 and the 2024 edition. [rust-toolchain.toml](rust-toolchain.toml) pins the release:
+with rustup, `cargo build --release` installs it and puts the binary at `target/release/dbgen`. `make` uses the host
+toolchain when it is at least 1.100, and the official Docker image of that release otherwise
+(`scripts/cargo-docker.sh`). SQLite is compiled in, and nothing else needs a system library.
+
+`make image` (or `docker build -t dbgen .`) builds a self-contained image, which runs as an unprivileged user:
+
+```bash
+docker run --rm --network host --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work dbgen generate -c dbgen.yaml
+```
+
+The configuration's `schema` paths must be inside the mounted directory, and `--user` keeps the files dbgen writes
+there (the resume state, SQLite databases) owned by you.
 
 ## Commands
 
@@ -444,15 +461,14 @@ reloads that table.
 ## Testing
 
 ```bash
-scripts/cargo-docker.sh test --lib            # unit tests, no database
-scripts/cargo-docker.sh test --test sqlite    # SQLite conformance tests, no server
-
-docker compose up -d
-DBGEN_TEST_POSTGRES_URL=postgres://dbgen:dbgen@localhost:15432 \
-DBGEN_TEST_MYSQL_URL=mysql://root:dbgen@localhost:13306 \
-DBGEN_TEST_CLICKHOUSE_URL=http://dbgen:dbgen@localhost:18123 \
-  scripts/cargo-docker.sh test
+make test              # unit tests and the SQLite conformance tests, no server
+make test-all          # every test: starts the servers of docker-compose.yml that are not running
+make test-postgres     # one connector (also test-mysql, test-sqlite, test-clickhouse)
 ```
+
+`make test-all` points the tests at the local servers through `DBGEN_TEST_POSTGRES_URL`, `DBGEN_TEST_MYSQL_URL` and
+`DBGEN_TEST_CLICKHOUSE_URL`. Override `PG_URL`, `MYSQL_URL` or `CH_URL` to use other servers, e.g.
+`make test-postgres PG_URL=postgres://user:pass@host:5432`.
 
 Every connector runs the same conformance suite ([tests/common/mod.rs](tests/common/mod.rs)):
 
@@ -465,6 +481,33 @@ Every connector runs the same conformance suite ([tests/common/mod.rs](tests/com
 The original ClickHouse tests also check the row encoding against the server. The tests create, fill and drop
 databases named `dbgen_it_*_test`, and touch nothing else. Without a server's variable, only its offline tests
 run. The unit tests need the `clickhouse` feature, which the default build has.
+
+## Code quality and security
+
+Each analyzer has a target. The ones that are not installed are fetched on first use: cargo tools with
+`cargo install`, the others as Docker images or with `npx`.
+
+| Target | Tool | Checks |
+|---|---|---|
+| `make fmt-check`, `make fmt` | rustfmt ([rustfmt.toml](rustfmt.toml)) | Rust formatting; `fmt` rewrites the files |
+| `make prettier-check`, `make prettier` | Prettier ([.prettierrc.yaml](.prettierrc.yaml)) | Markdown, YAML and JSON formatting; `prettier` rewrites the files |
+| `make lint`, `make lint-features` | clippy | Lints with warnings as errors, on every target; with no connector and with each one alone |
+| `make doc` | rustdoc | The API documentation, warnings as errors |
+| `make machete` | cargo-machete | Unused dependencies |
+| `make audit` | cargo-audit | Known vulnerabilities in dependencies (RustSec) |
+| `make deny` | cargo-deny ([deny.toml](deny.toml)) | Vulnerabilities, licenses, duplicate and banned crates, allowed sources |
+| `make secrets` | Gitleaks ([.gitleaks.toml](.gitleaks.toml)) | Credentials in the files and the git history |
+| `make trivy`, `make trivy-image` | Trivy | Vulnerabilities, secrets and misconfigurations in the repository; vulnerabilities in the Docker image |
+
+`make analyze` runs the code analyzers, `make security` the scanners, and `make ci` what a CI pipeline should run
+(lints, documentation, every test, `audit` and `deny`). Add `-k` to see every failure instead of stopping at the
+first one.
+
+`deny.toml` allows permissive licenses only and lists the advisories that are accepted, each with its reason. The
+credentials of the local test containers (`dbgen:dbgen`) are throwaway and public, so `.gitleaks.toml` allows
+them. Trivy fails on HIGH and CRITICAL findings that have a fix, and lists the others. The Docker image is
+distroless (the C library, CA certificates and the binary), so the findings it can have come from those few
+packages and go away when the base image is rebuilt.
 
 ## Performance
 

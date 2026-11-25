@@ -356,11 +356,10 @@ impl Config {
         let ignore_relations = raw.ignore_relations.iter().map(|s| ColumnRef::parse(s).map_err(|e| Error::Config(format!("ignore_relations: {e}")))).collect::<Result<_>>()?;
         for (k, c) in &raw.columns {
             ColumnRef::parse(k).map_err(|e| Error::Config(format!("columns: {e}")))?;
-            if let (Some(v), Some(w)) = (&c.values, &c.weights) {
-                if v.len() != w.len() {
+            if let (Some(v), Some(w)) = (&c.values, &c.weights)
+                && v.len() != w.len() {
                     return Err(Error::Config(format!("columns.{k}: values and weights have different lengths")));
                 }
-            }
             if c.null_rate.is_some_and(|r| !(0.0..=1.0).contains(&r)) {
                 return Err(Error::Config(format!("columns.{k}.null_rate must be between 0 and 1")));
             }
@@ -601,7 +600,9 @@ columns:
 
     #[test]
     fn expands_environment() {
-        std::env::set_var("DBGEN_TEST_PW", "s3cret");
+        // SAFETY: std serializes its own environment accesses, and nothing in this test
+        // binary reads the environment through C.
+        unsafe { std::env::set_var("DBGEN_TEST_PW", "s3cret") };
         assert_eq!(expand_env("http://u:${DBGEN_TEST_PW}@h/db").unwrap(), "http://u:s3cret@h/db");
         assert!(expand_env("${DBGEN_SURELY_UNSET_VAR}").is_err());
     }

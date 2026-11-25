@@ -126,11 +126,10 @@ pub fn parse_statement(stmt: &Statement) -> Result<Ddl, Diag> {
         if is_kw(t.get(i), "TABLE") {
             i += 1;
         }
-        if !is_kw(t.get(i), "FUNCTION") {
-            if let Some((table, _)) = read_name(t, i) {
+        if !is_kw(t.get(i), "FUNCTION")
+            && let Some((table, _)) = read_name(t, i) {
                 return Ok(Ddl::Insert { table });
             }
-        }
     }
     Ok(Ddl::Ignored(leading_words(stmt, 2)))
 }

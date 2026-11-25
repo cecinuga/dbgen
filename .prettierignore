@@ -1,0 +1,6 @@
+target/
+bin/
+reports/
+.dbgen/
+**/.dbgen/
+Cargo.lock

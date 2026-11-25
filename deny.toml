@@ -1,0 +1,40 @@
+# cargo-deny (`make deny`): what the dependency tree may contain.
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# Vulnerabilities and unsound crates fail. Crates flagged unmaintained fail too, unless
+# listed here with the reason they stay; `make audit` keeps reporting them.
+yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono: no maintained release to move to yet; used only for clock access and RFC 3339 parsing" },
+]
+
+[licenses]
+# Permissive licenses only. dbgen itself is private (publish = false), so its own
+# license is not checked.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",          # Unicode data tables (ICU crates, used to parse URLs)
+    "CDLA-Permissive-2.0",  # certificate data
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+ignore = true
+
+[bans]
+# Two versions of one crate are reported, not refused: the drivers pull their own.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

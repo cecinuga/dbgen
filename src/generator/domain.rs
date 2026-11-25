@@ -231,11 +231,10 @@ pub fn table_stem(table: &str) -> String {
 /// A table name without its warehouse prefix: `dim_staff` -> `staff`.
 pub fn strip_table_prefix(t: &str) -> String {
     for p in ["dim_", "fact_", "fct_", "d_", "f_", "tbl_", "t_", "ref_", "lkp_", "lookup_", "stg_"] {
-        if let Some(rest) = t.strip_prefix(p) {
-            if !rest.is_empty() {
+        if let Some(rest) = t.strip_prefix(p)
+            && !rest.is_empty() {
                 return rest.to_string();
             }
-        }
     }
     t.to_string()
 }
@@ -406,11 +405,10 @@ impl Domain {
             Domain::Uuid => Value::Uuid(rng.uuid_v4()),
             Domain::Text { kind, max_len, pool } => {
                 let mut s = kind.render(rng, *pool);
-                if let Some(m) = max_len {
-                    if s.chars().count() > *m as usize {
+                if let Some(m) = max_len
+                    && s.chars().count() > *m as usize {
                         s = s.chars().take(*m as usize).collect();
                     }
-                }
                 Value::Str(s)
             }
             Domain::Fixed { n } => Value::Str((0..*n).map(|_| (b'A' + rng.below(26) as u8) as char).collect()),

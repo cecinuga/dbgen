@@ -9,9 +9,9 @@ use std::fmt::Write as _;
 use crate::config::{yaml_str, ColumnConfig, Config, Distribution, MissingTables, TableTarget};
 use crate::error::{Error, Result};
 use crate::expr::{cast, CExpr, Compiler, EvalCtx};
-use crate::gen::domain::{self, default_domain, domain_nth, domain_size, Domain, TextKind, Unique};
-use crate::gen::perm::Perm;
-use crate::gen::{CheckGen, ColGen, Component, ExistingRows, Mutability, Pick, ProductGen, RelGen, Row, Strategy, TableGen, World};
+use crate::generator::domain::{self, default_domain, domain_nth, domain_size, Domain, TextKind, Unique};
+use crate::generator::perm::Perm;
+use crate::generator::{CheckGen, ColGen, Component, ExistingRows, Mutability, Pick, ProductGen, RelGen, Row, Strategy, TableGen, World};
 use crate::rng::{hash, tag};
 use crate::schema::{DataType, KeyPart, Schema, Table};
 use crate::sql::DefaultKind;
@@ -731,11 +731,10 @@ fn build_table(
     }
     // Unknown columns in the configuration.
     for key in config.columns.keys() {
-        if let Some((tn, cn)) = key.rsplit_once('.') {
-            if tn == t.name && t.column(cn).is_none() {
+        if let Some((tn, cn)) = key.rsplit_once('.')
+            && tn == t.name && t.column(cn).is_none() {
                 found.problems.push(format!("columns.{key}: table {} has no column {cn}{}", t.name, suggest(cn, t.columns.iter().map(|c| c.name.as_str()))));
             }
-        }
     }
 
     // What the checks say about single columns.
@@ -749,16 +748,14 @@ fn build_table(
             }
         }
         for conj in e.conjuncts() {
-            if let Some((c, vals)) = conj.closed_domain() {
-                if let Strategy::Random(_) = cols[c].strategy {
-                    if !configured[c] {
+            if let Some((c, vals)) = conj.closed_domain()
+                && let Strategy::Random(_) = cols[c].strategy
+                    && !configured[c] {
                         let vals: Vec<Value> = vals.into_iter().map(|v| cast(v, &cols[c].ty)).filter(|v| !v.is_null()).collect();
                         if !vals.is_empty() {
                             cols[c].strategy = Strategy::Random(Domain::values(vals, None));
                         }
                     }
-                }
-            }
             for (c, op, v) in conj.bounds() {
                 let col = &mut cols[c];
                 if let Strategy::Random(d) = &mut col.strategy {
@@ -938,11 +935,10 @@ fn build_table(
     for c in 0..cols.len() {
         let n = cols[c].name.to_ascii_lowercase();
         let id_like = n == "id" || n.ends_with("_id") || n.ends_with("_key") || n.ends_with("_uuid");
-        if id_like && !configured[c] && !cols[c].nullable && matches!(cols[c].strategy, Strategy::Random(Domain::Int { .. } | Domain::Uuid)) && !check_cols.contains(&c) {
-            if let Some(u) = make_unique(&cols[c], rows, g.seed, table_tag, window) {
+        if id_like && !configured[c] && !cols[c].nullable && matches!(cols[c].strategy, Strategy::Random(Domain::Int { .. } | Domain::Uuid)) && !check_cols.contains(&c)
+            && let Some(u) = make_unique(&cols[c], rows, g.seed, table_tag, window) {
                 cols[c].strategy = Strategy::Unique(u);
             }
-        }
         if config.column(&t.name, &cols[c].name).and_then(|cc| cc.unique) == Some(true) && !matches!(cols[c].strategy, Strategy::Unique(_)) {
             match make_unique(&cols[c], rows, g.seed, table_tag, window) {
                 Some(u) => cols[c].strategy = Strategy::Unique(u),
@@ -951,8 +947,8 @@ fn build_table(
         }
     }
     // The partitioning column follows row order, so a batch touches few partitions.
-    if let Some(p) = &t.partition_by {
-        if let Ok(e) = compiler.compile(&p.expr) {
+    if let Some(p) = &t.partition_by
+        && let Ok(e) = compiler.compile(&p.expr) {
             let mut used = BTreeSet::new();
             e.columns(&mut used);
             if used.len() == 1 {
@@ -972,7 +968,6 @@ fn build_table(
                 }
             }
         }
-    }
 
     // Mutability, purity, repairable columns, evaluation order.
     for (c, col) in cols.iter_mut().enumerate() {
@@ -1038,11 +1033,10 @@ fn depends_on(deps: &HashMap<usize, Vec<usize>>, from: usize, target: usize) -> 
         if c == target {
             return true;
         }
-        if seen.insert(c) {
-            if let Some(d) = deps.get(&c) {
+        if seen.insert(c)
+            && let Some(d) = deps.get(&c) {
                 stack.extend(d.iter().copied());
             }
-        }
     }
     false
 }
@@ -1118,11 +1112,10 @@ fn make_unique(col: &ColGen, rows: u64, seed: u64, table_tag: u64, window: (i64,
         }
         (Domain::Float { lo, .. }, _) => Some(Unique::Float { start: lo.max(1.0), step: 1.0 }),
         (Domain::Text { kind, max_len, .. }, _) => {
-            if let Some(m) = max_len {
-                if (*m as usize) < (rows.to_string().len() + 1) {
+            if let Some(m) = max_len
+                && (*m as usize) < (rows.to_string().len() + 1) {
                     return None;
                 }
-            }
             Some(Unique::Text { kind: kind.clone(), key, max_len: *max_len })
         }
         (Domain::Fixed { n: width }, _) => {
@@ -1304,27 +1297,26 @@ fn detect_cycles(world: &World, schema: &Schema, problems: &mut Vec<String>) {
 /// Generated tables by dependency level, parents before children (cycles broken
 /// arbitrarily).
 fn load_levels(world: &World, tables: &[TablePlan]) -> Vec<Vec<usize>> {
-    let gen: Vec<usize> = (0..tables.len()).filter(|&i| matches!(tables[i].mode, Mode::Generate(_))).collect();
-    let mut level: HashMap<usize, usize> = gen.iter().map(|&i| (i, 0)).collect();
-    for _ in 0..gen.len() {
+    let generated: Vec<usize> = (0..tables.len()).filter(|&i| matches!(tables[i].mode, Mode::Generate(_))).collect();
+    let mut level: HashMap<usize, usize> = generated.iter().map(|&i| (i, 0)).collect();
+    for _ in 0..generated.len() {
         let mut changed = false;
         for r in &world.relations {
             if r.child == r.parent {
                 continue;
             }
-            if let (Some(&lp), Some(&lc)) = (level.get(&r.parent), level.get(&r.child)) {
-                if lc <= lp && lp < gen.len() {
+            if let (Some(&lp), Some(&lc)) = (level.get(&r.parent), level.get(&r.child))
+                && lc <= lp && lp < generated.len() {
                     level.insert(r.child, lp + 1);
                     changed = true;
                 }
-            }
         }
         if !changed {
             break;
         }
     }
     let mut levels: Vec<Vec<usize>> = Vec::new();
-    for ti in gen {
+    for ti in generated {
         let l = level[&ti];
         if levels.len() <= l {
             levels.resize(l + 1, Vec::new());

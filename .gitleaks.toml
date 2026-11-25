@@ -1,0 +1,9 @@
+# Gitleaks (`make secrets`): the default rules, except for the credentials of the local
+# test containers (docker-compose.yml), which are throwaway and meant to be public.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Throwaway credentials of the local test containers"
+regexes = ['''(dbgen|root):dbgen@''', '''PASSWORD: dbgen''']
+paths = ['''(^|/)target/''', '''(^|/)bin/''']

@@ -1,0 +1,4 @@
+# Prettier, for Markdown, YAML and JSON (`make prettier-check`). Prose is wrapped by hand
+# at about 120 columns, so Prettier keeps line breaks as they are.
+printWidth: 120
+proseWrap: preserve

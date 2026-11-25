@@ -12,7 +12,7 @@
 //! | [`config`] | `dbgen.yaml` |
 //! | [`connector`], [`connectors`] | The connector API, and one connector per database, listed in a registry |
 //! | [`sql`], [`dialect`], [`schema`] | DDL text to an in-memory schema, through the connector's dialect |
-//! | [`plan`], [`gen`], [`expr`], [`rng`] | How every column gets its values; CHECKs; determinism |
+//! | [`plan`], [`generator`], [`expr`], [`rng`] | How every column gets its values; CHECKs; determinism |
 //! | [`db`] | The connected database ([`db::Backend`]) and the toolkit connectors share |
 //! | [`engine`], [`state`] | The load pipeline, retries, resume |
 //! | [`run`], [`verify`], [`report`], [`progress`] | The commands and their output |
@@ -28,7 +28,7 @@ pub mod dialect;
 pub mod engine;
 pub mod error;
 pub mod expr;
-pub mod gen;
+pub mod generator;
 pub mod plan;
 pub mod progress;
 pub mod report;
