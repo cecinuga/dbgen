@@ -1,157 +1,288 @@
-# dwh-generator
+# dbgen
 
-Fills the Agevola reporting DWH with synthetic data, so the reporting system can be stress-tested at
-progressively larger volumes. You set the number of rows per table in a YAML file; the generator loads
-exactly that many, consistent across tables and reproducible from a seed.
+Fills a ClickHouse database with synthetic data, so whatever reads it can be stress-tested at progressively
+larger volumes. dbgen reads the schema from the SQL DDL you already have, such as a directory of migrations, so
+it needs no code for your tables. You set the number of rows per table in a YAML file, and dbgen loads exactly
+that many. Keys are unique, references resolve and CHECK constraints hold, and the same seed always gives the
+same data.
 
-It uses no production data and needs no pre-populated tables. It runs against the schema created by the
-`reporting-etl-service` migrations and never changes that schema.
+It uses no production data. It never changes the schema, except when you run `dbgen apply`, which runs your DDL.
+
+The main use is the Agevola reporting DWH ([examples/agevola/](examples/agevola/)). The integration tests run it
+on [tests/fixtures/shop.sql](tests/fixtures/shop.sql), a small schema unrelated to Agevola.
 
 ## Quick start
 
-No Rust toolchain is needed on the host; the wrapper script builds inside the official Rust image.
+No Rust toolchain is needed on the host: the wrapper script builds inside the official Rust image.
 
 ```bash
-docker compose up -d                                # TimescaleDB on localhost:5436
-scripts/cargo-docker.sh build --release             # binary at bin/dwh-generator
-scripts/provision-dwh.sh config.yaml                # create the database and apply the ETL migrations
+docker compose up -d                       # ClickHouse 26.8, HTTP on localhost:18123, user dbgen / dbgen
+scripts/cargo-docker.sh build --release    # binary at bin/dbgen
 
-bin/dwh-generator validate --config config.yaml     # check config and schema, print the plan, write nothing
-bin/dwh-generator generate --config config.yaml --verify
+bin/dbgen inspect  -c tests/fixtures/shop.yaml                     # schema and plan, no database needed
+bin/dbgen apply    -c tests/fixtures/shop.yaml --create-database   # create the database and run the DDL
+bin/dbgen validate -c tests/fixtures/shop.yaml                     # check everything, write nothing
+bin/dbgen generate -c tests/fixtures/shop.yaml --verify            # load, then check the result
 ```
 
-With a local toolchain (Rust 1.85 or later), `cargo build --release` works too, and the binary is at
-`target/release/dwh-generator`.
+Other ways to build:
 
-`provision-dwh.sh` expects the ETL repository at `../reporting-etl-service`. Set `MIGRATIONS_DIR` if it
-is elsewhere.
+- With a local toolchain (Rust 1.85 or later), `cargo build --release` puts the binary at `target/release/dbgen`.
+- `docker build -t dbgen .` builds a self-contained image. Run it with
+  `docker run --rm --network host -v "$PWD:/work" -w /work dbgen generate -c dbgen.yaml`. The configuration's
+  `schema` paths must be inside the mounted directory.
+
+The Agevola configurations read the DDL from the ETL repository. They expect it next to this repository, at
+`../reporting-etl-service/sql/migrations`.
 
 ## Commands
 
-| Command | What it does |
-|---|---|
-| `validate --config FILE` | Checks the config against the live schema and prints the plan. Writes nothing. |
-| `generate --config FILE` | Loads the configured rows, and resumes automatically if a previous run was interrupted. |
-| `verify --config FILE` | Runs the integrity and coherence checks on what is in the database. |
+| Command | What it does | Database |
+|---|---|---|
+| `inspect [-c FILE] [FILES...]` | Compiles the DDL and prints the schema. With a configuration, also prints the generation plan. | Not needed |
+| `validate -c FILE` | Checks the configuration against the DDL and the live database, generates sample rows, and prints the plan. Writes nothing. | Read |
+| `apply -c FILE` | Runs every statement of the DDL, in order. | Written |
+| `generate -c FILE` | Loads the configured rows. Resumes automatically if a previous run was interrupted. | Written |
+| `verify -c FILE` | Checks the data in the database: row counts, unique keys, references and CHECK constraints. | Read |
 
-Options for `generate`:
+`-c` (`--config`) defaults to `dbgen.yaml` in the current directory.
 
-| Option | Effect |
-|---|---|
-| `--reset` | Truncates every generated table first. Seeded reference data is kept. **Destroys existing generated data.** |
-| `--dry-run` | Validates and prints the plan, then stops. |
-| `--verify` | Runs the verification checks after a successful load. |
-| `--report FILE` | Writes the summary as JSON. `verify` accepts it too. |
-| `--no-progress` | Prints periodic log lines instead of progress bars. |
+Options:
 
-Global options: `--log-level LEVEL` (or `DWHGEN_LOG`) and `--log-format pretty|json`.
+| Option | Command | Effect |
+|---|---|---|
+| `--reset` | `generate` | Empties every generated table first. **Destroys the data in those tables.** |
+| `--dry-run` | `generate` | Validates and prints the plan, then stops. |
+| `--verify` | `generate` | Runs the verification checks after a successful load. |
+| `--report FILE` | `generate`, `verify` | Writes the summary, or the check results, as JSON. |
+| `--no-progress` | `generate` | Prints periodic log lines instead of progress bars. |
+| `--create-database` | `apply` | Creates the database first if it does not exist. |
+| `--json` | `inspect` | Prints the compiled schema as JSON. |
+| `--dialect NAME` | `inspect` | Dialect of `FILES` (default and only value: `clickhouse`). |
+
+Global options: `--log-level LEVEL` (or `DBGEN_LOG`), which also accepts a filter such as `dbgen=debug,info`,
+and `--log-format pretty|json`. Logs go to stderr. The plan, the summary and the check results go to stdout.
+
+`apply` runs the statements exactly as written. On a database that already has the schema, it succeeds only if
+the statements can run twice, as `CREATE TABLE IF NOT EXISTS` can.
 
 ## Configuration
 
-`config.yaml` is a working example.
+[tests/fixtures/shop.yaml](tests/fixtures/shop.yaml) is a short complete example, and
+[examples/agevola/dbgen.yaml](examples/agevola/dbgen.yaml) a real one.
 
 ```yaml
-DWH_DB_SOURCE: "postgresql://postgres:postgres@localhost:5436/reporting_dwh_db?sslmode=disable"
+database: "http://dbgen:dbgen@localhost:18123/dbgen_shop_test"
+schema: shop.sql
 
 generation:
-  seed: 42
-  batch_size: 10000
-  workers: 8
+  seed: 7
+  history_days: 90
+  end_time: "2026-01-01"
 
 tables:
-  dim_floor: 6
-  dim_room: 46
-  fact_alarms: 50000
-  # ...
+  customers: 2000
+  orders: 20000
+  order_lines: 50000
+  countries: existing
+
+relations:
+  - "customers.country_code -> countries.code"
+
+columns:
+  orders.status: { values: [new, paid, shipped, cancelled], weights: [1, 3, 5, 1] }
 ```
 
-### `DWH_DB_SOURCE`
+| Key | Meaning |
+|---|---|
+| `database` | Where to load. See below. |
+| `dialect` | SQL dialect of the DDL. Only `clickhouse` exists, and it is the default. |
+| `schema` | DDL files or directories, one path or a list. |
+| `generation` | Seed, time window and load tuning. |
+| `tables` | Rows per table. |
+| `relations`, `ignore_relations` | References between tables that the DDL does not declare. |
+| `columns` | Value settings for individual columns. |
 
-A PostgreSQL connection string, as a URL or in `key=value` form, and the only connection setting. All
-`sslmode` values are supported, along with `sslrootcert`. Client certificates are not.
+Relative paths are resolved against the configuration file's directory. Unknown keys are errors, so a typo
+cannot go unnoticed.
 
-`${VAR}` is expanded from the environment, which keeps passwords out of the file:
+### `database`
+
+`http://user:password@host:8123/database`. Use `https://`, or add `?secure=true`, for TLS, where the default port
+is 8443. `clickhouse://` is accepted and means HTTP. The user and the database both default to `default`. dbgen
+uses the HTTP interface only, and rejects the native protocol ports 9000 and 9440.
+
+`${VAR}` is expanded from the environment, which keeps passwords out of the file. An unset variable is an error.
 
 ```yaml
-DWH_DB_SOURCE: "postgresql://dwh:${DWH_PASSWORD}@db:5432/reporting_dwh_db"
+database: "http://clickhouse:${CH_PASSWORD}@localhost:8125/reporting_dwh_db"
 ```
+
+### `schema`
+
+The statements are applied in order, as a migration tool would apply them. A directory contributes its `*.sql`
+files sorted by name. If the directory holds `*.up.sql` files, only those are used.
+
+dbgen follows `CREATE TABLE` (including `AS other_table`), `ALTER TABLE` column and constraint changes,
+`MODIFY ORDER BY`, and `DROP`, `RENAME` and `EXCHANGE` of tables. From these it learns the column types,
+defaults, keys, CHECK constraints, table engine and partitioning. Two other statements change how a table is
+treated:
+
+- an `INSERT` marks its table as seeded reference data;
+- `CREATE MATERIALIZED VIEW ... TO target` marks the target as written by the view.
+
+All other statements are counted and ignored. `inspect` lists them.
 
 ### `generation`
 
 | Key | Default | Meaning |
 |---|---|---|
-| `seed` | `42` | Same seed, targets and window give identical data. |
-| `batch_size` | `10000` | Rows per `COPY`. Each batch commits atomically. Does not change the data. |
-| `workers` | `8` | Concurrent `COPY` connections. Does not change the data. |
-| `table_concurrency` | `1` | Tables of one dependency level loaded at the same time. |
-| `generator_threads` | `min(workers, CPUs)` | Threads encoding batches. |
+| `seed` | `42` | The same seed, DDL, configuration and window give identical data. |
+| `history_days` | `365` | Length of the time window that dates and timestamps fall in. |
+| `end_time` | 00:00 UTC today | End of the window, as `YYYY-MM-DD` or a timestamp. |
+| `null_rate` | `0.1` | Share of NULLs in nullable columns. |
+| `infer_relations` | `true` | Infer references from column names. See [Relations](#relations). |
+| `fill_defaults` | `false` | Generate columns that have a `DEFAULT`, instead of leaving them to the database. |
+| `missing_tables` | `warn` | Tables absent from `tables`: `warn` leaves them alone, `error` refuses to run. |
+| `max_repair_steps` | `200` | Search steps per row to satisfy CHECK constraints. |
+| `max_existing_rows` | `1000000` | Rows read from each table that is referenced but not generated. |
+| `batch_size` | `100000` | Rows per `INSERT`. Does not change the data. |
+| `workers` | `4` | Concurrent `INSERT` connections. Does not change the data. |
+| `table_concurrency` | `2` | Tables loaded at the same time, parents first. |
+| `generator_threads` | `min(workers, CPUs)` | Threads generating and encoding rows. |
 | `queue_depth` | `2 × workers` | Encoded batches waiting for a connection. Bounds memory use. |
-| `history_days` | `365` | Length of the simulated history. |
-| `end_time` | 00:00 UTC today | End of the history, as `YYYY-MM-DD` or RFC 3339. |
 | `max_retries` | `5` | Attempts per batch, on transient failures only. |
-| `missing_tables` | `warn` | Generated tables absent from `tables`: `warn` leaves them empty, `error` refuses to run. |
-| `pause_columnstore_policies` | `true` | Pauses TimescaleDB compression during the load and restores it afterwards. |
-| `compress_after_load` | `false` | Runs the compression policies once after the load. |
-| `analyze_after_load` | `true` | Runs `ANALYZE` on the loaded tables. |
-| `synchronous_commit` | `false` | `synchronous_commit` for loader sessions. |
+| `http_timeout_secs` | `300` | Timeout of one request to ClickHouse. |
 | `state_file` | see [Resuming](#resuming) | Location of the resume state. |
 | `progress_interval_secs` | `10` | Interval between progress log lines. |
 
-Set `end_time` if you need identical data on different days. Without it, the history ends at midnight of
-the day the run starts, so the same seed produces different timestamps tomorrow.
+Set `end_time` if you need identical data on different days. Without it, the window ends at midnight of the
+day the run starts, so the same seed produces different timestamps tomorrow.
 
 ### `tables`
 
-Each value is the exact number of rows the generator inserts into that table.
-
-| Tables | Treatment |
+| Value | Treatment |
 |---|---|
-| Seeded: `dim_area_type`, `dim_bed_status`, `dim_room_status`, `dim_floor_status`, `dim_alarm_priority`, `dim_alarm_category`, `dim_alarm_sla_target`, `languages`, `translation` | Never written. Omit them, set 0, or state their current size. |
-| Operational: `etl_metadata`, `etl_load_checkpoint` | Never written. Omit them or set 0. |
-| All other tables | Generated. See `config.yaml` for the full list. |
+| a number | Generate exactly that many rows. |
+| `existing` | Never written. Its rows are read when generated tables reference it. |
+| `skip`, `0` or empty | Never written or read. |
 
-Some targets depend on each other, and `validate` reports every violation in one pass:
+Tables not listed are never written:
 
-- `dim_location` ≥ `dim_bed`, `dim_room_version` ≥ `dim_room`, `dim_floor_version` ≥ `dim_floor`. Every
-  entity needs at least one version; extra rows become later versions.
-- `fact_staff_activity` ≤ 5 × staff × weeks of history, because the table holds one row per staff member
-  per working day. Staff is about `dim_staff / 1.1`.
-- Facts need their parents: for example `fact_patient_occupancy` needs `dim_patient` and `dim_location`.
-- Histories cannot be denser than one event per second per entity, and stays cannot be shorter than five minutes.
+- Tables the DDL seeds with `INSERT`, and targets of materialized views, are treated as `existing`.
+- Tables that store no rows, such as views or `Null` and `Distributed` tables, are skipped.
+- Any other table is treated as `existing`, with a warning, or an error if `missing_tables` is `error`.
 
-`dim_patient` and `dim_staff` targets count SCD2 rows, not people: 60 `dim_patient` rows is 50 patients.
+Inserting into a table that a materialized view reads fires the view, as it would in production. In the shop
+example, `daily_sales` fills up from `orders` and `order_lines`.
 
-## Stress-test series
+### Relations
 
-`configs/config.1.yaml` to `config.6.yaml` target one database each, `reporting_dwh_db_1` to `_6`, so the
-datasets can coexist. They are corrected copies of the `config.N.yaml` files in the project root, which do
-not pass validation. Fact volumes are unchanged, and a header in each file lists its changes.
+A relation says that a column of a child table holds a key of a parent table. Each child row then points at an
+existing parent row. dbgen finds relations in three places. When two sources claim the same column, the first
+one in this list wins:
 
-| Config | Rows per fact table | Total rows |
-|---|---|---|
-| 1 | 50,000 | 800,565 |
-| 2 | 150,000 | 2,400,988 |
-| 3 | 500,000 | 8,002,469 |
-| 4 | 1,500,000 | 24,006,700 |
-| 5 | 5,000,000 | 80,021,507 |
-| 6 | 3,000,000 | 48,013,046 |
+1. `relations` in the configuration.
+2. `FOREIGN KEY` declarations in the DDL.
+3. Column names, when `infer_relations` is on. A column ending in `_id`, `_key`, `_uuid` or `_code` that names a
+   table refers to that table. The table name may carry a `dim_` or `fact_` prefix and be singular or plural. The
+   parent column is the one with the same name, else `id`, `key`, etc., else the parent's primary key. Leading
+   words of the column name are a role: `acknowledger_staff_key` refers to `dim_staff.staff_key`.
 
-Two things to be aware of:
+`dbgen inspect -c FILE` lists every relation with its source (`config`, `ddl` or `inferred`). Declare the ones
+whose names do not reveal them, and remove wrong ones with `ignore_relations`:
 
-- Config 5 is larger than config 6. This comes from the original files.
-- These configs keep a 60-bed facility, so `dim_staff` grows to satisfy `fact_staff_activity`, reaching 12,693
-  rows in config 6. To keep a realistic staff size, lower `fact_staff_activity` instead.
-
-To run a series, provisioning each database and keeping one report per config:
-
-```bash
-scripts/run-stress-suite.sh                                       # all of configs/
-scripts/run-stress-suite.sh configs/config.1.yaml configs/config.2.yaml
-scripts/run-stress-suite.sh --no-verify configs/config.5.yaml
+```yaml
+relations:
+  - "orders.customer_id -> customers.customer_id"
+  - "fact_alarms.(sla_category, sla_priority) -> dim_alarm_sla_target.(category_name, priority_name)"
+  - { from: "fact_alarms.patient_key", to: "dim_patient.patient_key", distribution: skewed, skew: 2 }
+ignore_relations: ["orders.parent_id"]
 ```
 
-The script **resets each target database** before loading it, and stops at the first failure. Reports and
-logs go to `reports/`.
+`distribution` is `uniform` (the default) or `skewed`. With `skewed`, a few parents get most children, and a
+higher `skew` (default `1.5`) concentrates them more.
+
+The parent can be a generated table or an `existing` one, whose rows dbgen reads first. If the parent has no
+rows, a nullable child column is left NULL and a non-nullable one fails validation.
+
+### `columns`
+
+Settings for one column, under `table.column`:
+
+| Setting | Effect |
+|---|---|
+| `values: [...]`, with optional `weights: [...]` | Picks from the list, proportionally to the weights. |
+| `range: [lo, hi]` | Inclusive bounds: numbers, dates or timestamps. |
+| `value: v` | Always `v`, which may be `null`. |
+| `null_rate: 0.3` | Share of NULLs, for nullable columns. |
+| `kind: email` | Kind of text: `first_name`, `last_name`, `full_name`, `email`, `phone`, `city`, `country`, `address`, `postal_code`, `url`, `sentence`, `word`, `code`, `uuid`, `json`, `ip`. |
+| `unique: true` | Every value distinct. Fails validation if the type cannot hold that many values. |
+| `generate: false` | Leaves the column to the database: its default, or NULL. |
+| `after: col`, `gap: [min, max]` | A date or timestamp that follows `col` by a gap such as `[10s, 30m]`. Units: `us`, `ms`, `s`, `m`, `h`, `d`, `w`. |
+| `length: [min, max]` | Number of elements of an `Array` or `Map`. |
+
+### Columns without settings
+
+- **Text** gets plausible values from the column name: `email` gets e-mail addresses, `city` city names,
+  `*_status` or `*_type` a small set of codes, `*_name` labels such as `Floor 3`, and so on.
+- **Numbers** get a range suggested by the last word of the name, such as a count or a duration.
+- **Dates and timestamps** fall in the time window. Birth dates are in the past. The column a table is
+  partitioned by follows row order, so each batch touches few partitions.
+- **Keys are unique by construction.** This covers primary keys, `UNIQUE` keys, the sorting key of engines that
+  merge rows sharing it (`ReplacingMergeTree`, `CollapsingMergeTree`, `SummingMergeTree` and the like), and
+  identifier-looking columns (`id`, `*_id`, `*_key`, `*_uuid`). For a composite key, dbgen enumerates
+  combinations without repeats, and validation fails if more rows are requested than combinations exist.
+- **Columns with a `DEFAULT`** are left to the database, unless a key, a reference or a CHECK involves them.
+  `MATERIALIZED` and `ALIAS` columns are never inserted. Engine control columns get the value that keeps the
+  row: `is_deleted = 0` for `ReplacingMergeTree`, `sign = 1` for collapsing engines.
+- **CHECK constraints** shape the values. `c = expr` computes `c`, `IN (...)` and comparisons narrow a column's
+  values, and `end > start` makes `end` follow `start`. A row that still violates a check is repaired by a short
+  search. `validate` generates sample rows of every table to catch impossible checks before anything is written.
+
+## What the data guarantees
+
+Every generated row satisfies the schema: keys are unique, references point at existing parent rows, and CHECK
+constraints hold. Row `i` of a table is a function of the seed and `i` only. That is why the data does not depend
+on `batch_size`, `workers` or interruptions, and why a child row can compute the key of the parent row it
+references without reading it.
+
+dbgen knows the structure, not the domain. In the Agevola DWH, an alarm's `patient_key` is a valid patient, but
+that patient is not necessarily in that bed at that time. Reports that join facts on domain rules will see
+coherent keys and arbitrary combinations.
+
+## Agevola stress series
+
+| Configuration | Target |
+|---|---|
+| [examples/agevola/dbgen.yaml](examples/agevola/dbgen.yaml) | `agevola_dwh` on the local ClickHouse of `docker compose` |
+| [examples/agevola/reporting-test.yaml](examples/agevola/reporting-test.yaml) | The REPORTING-TEST ClickHouse on `localhost:8125`, password in `CH_PASSWORD` |
+| [examples/agevola/stress/](examples/agevola/stress/) `stress-1.yaml` to `stress-6.yaml` | `agevola_stress_1` to `_6`, so the datasets can coexist |
+
+The stress configurations share tables, relations and column settings, and differ only in the size of the fact
+tables:
+
+| Configuration | Rows per fact table | Total rows |
+|---|---|---|
+| `stress-1` | 50,000 | 750,927 |
+| `stress-2` | 150,000 | 2,250,927 |
+| `stress-3` | 500,000 | 7,500,927 |
+| `stress-4` | 1,500,000 | 22,500,927 |
+| `stress-5` | 5,000,000 | 75,000,927 |
+| `stress-6` | 3,000,000 | 45,000,927 |
+
+Each total is 15 fact tables times the per-table figure, plus 927 rows of dimensions and `fact_vitals_daily`.
+Note that `stress-5` is larger than `stress-6`.
+
+To run a series, applying the DDL to each database and keeping one report per configuration:
+
+```bash
+scripts/run-stress-suite.sh examples/agevola/stress/*.yaml
+scripts/run-stress-suite.sh --no-verify examples/agevola/stress/stress-5.yaml
+```
+
+The script **empties the generated tables of each target database** before loading it, and stops at the first
+failure. Reports and logs go to `reports/`. `BIN` and `REPORTS` override the binary and the output directory.
 
 To point the reporting system at a dataset, set its DWH connection to the matching database.
 
@@ -163,18 +294,19 @@ On a terminal, `generate` shows one progress bar per active table plus a total. 
 The summary at the end looks like this:
 
 ```text
-Table                             Target Rows  Inserted Rows     Final Rows   Duration       Rows/s  Retries  Status
---------------------------------------------------------------------------------------------------------------
-fact_alarms                           500,000        500,000        500,000   00:06:13        1,341       25  Success
-fact_patient_events                   500,000 460,000+40,000        500,000   00:06:03        1,267        0  Success
+Table                              Target Rows   Inserted Rows    Final Rows   Repaired  Duration      Rows/s Retries  Status
+----------------------------------------------------------------------------------------------------------------------
+fact_alarms                             50,000          50,000        50,000          0  00:00:00     253,021       0  Success
+fact_bed_status                        150,000  50,000+100,000       150,000          0  00:00:00     312,447       0  Success
 ```
 
 | Column | Meaning |
 |---|---|
-| Inserted Rows | Rows written by this run. `460,000+40,000` means 40,000 were already committed by an interrupted run. |
-| Final Rows | An exact `count(*)` taken after the load, not a counter kept by the generator. |
-| Rows/s | Rows inserted divided by the table's elapsed time. When tables load concurrently they share the workers, so use the total for throughput. |
-| Retries | Batches retried after a transient failure such as a deadlock. Retried batches are not duplicated. |
+| Inserted Rows | Rows written by this run. `50,000+100,000` means 100,000 were already committed by an interrupted run. |
+| Final Rows | An exact `count()` taken after the load, not a counter kept by dbgen. |
+| Repaired | Rows that needed the CHECK repair search. |
+| Rows/s | Rows inserted divided by the table's elapsed time. Tables loading at the same time share the workers, so use the total for throughput. |
+| Retries | Batches retried after a transient failure. |
 | Status | `Success` (final equals target), `Mismatch` (load finished, counts differ), `Incomplete` (run stopped first). |
 
 Exit codes:
@@ -183,84 +315,80 @@ Exit codes:
 |---|---|
 | 0 | Success |
 | 1 | Load or verification failed |
-| 2 | Invalid configuration or schema |
+| 2 | Invalid configuration, DDL or plan |
 | 3 | Cannot connect |
 | 130 | Interrupted; can be resumed |
 
 ### Verification
 
-`verify` runs about 60 queries that each count violations of something the database cannot enforce:
+`verify`, or `generate --verify`, runs one query per check, each counting violations:
 
-- references that hypertables cannot declare
-- overlapping intervals
-- facts pointing at an SCD2 version not in force at their instant
-- the reconciliation checks in `sql/README.md` of the ETL repository
-- agreement between tables, such as a vital reading's patient occupying that bed at that instant
+| Check | What it counts |
+|---|---|
+| `rows.TABLE` | Difference between the row count and the target. |
+| `unique.TABLE.(KEY)` | Duplicate keys, for every primary key, `UNIQUE` key and merging sorting key. |
+| `collapse.TABLE` | Rows lost to background merges, on engines that merge rows. |
+| `check.TABLE.NAME` | Rows violating a CHECK constraint. |
+| `reference.CHILD.COLS -> PARENT.COLS` | Non-NULL references without a parent row, for every relation. |
 
-`Pass` means zero violations, and `Skip` means a table involved is empty. `Fail` and `Error` make the command exit
-with 1.
-
-On a freshly migrated DWH, expect one `Warn`: `reconciliation.6.priority_weights_sum`. The weights seeded in
-`dim_alarm_priority` sum to 1.8, which comes from the migrations and not from generated data. See
-[docs/SCHEMA.md](docs/SCHEMA.md#findings-in-the-existing-schema).
+`PASS` means zero violations, and `SKIP` means the child table of a reference is empty. `FAIL` and `ERROR` make
+the command exit with 1. The checks scan whole tables, some with `FINAL`, so on large datasets they take
+noticeable time.
 
 ## Resuming
 
-Run the same command again. Each batch commits atomically, so committed batches are detected and kept, and
-only the rest are inserted.
+Run the same command again. Committed batches are kept, and only the rest are inserted.
 
-- **Ctrl-C once** stops new batches, lets in-flight ones commit, restores the compression policies and prints a
-  summary. **Twice** exits immediately; the server rolls back whatever had not committed.
-- The state lives in `.dwh-generator/<host>_<port>_<database>.json` next to the config, one file per database.
-- If a run dies abruptly, the compression policies stay paused until the next run of that config restores them.
+- **Ctrl-C once** stops taking new batches, lets in-flight inserts finish, saves the state and prints a summary.
+  **Twice** exits immediately.
+- The state lives in `.dbgen/<host>_<port>_<database>.json` next to the configuration, one file per database.
+  `generation.state_file` overrides it.
+- A generated table whose row count differs from what the state records is emptied and loaded again, with a
+  warning.
 
-The generator refuses to resume if the seed, targets, window, batch size or schema version changed, and lists what
-differs. It also refuses to write to generated tables that hold rows it cannot account for. In both cases, the way
-out is to restore the config or use `--reset`.
+dbgen refuses to resume if the seed, batch size, window, row targets, DDL, relations or column settings
+changed, and lists what differs. Without a state file, it refuses to write to generated tables that already hold
+rows. In both cases, the way out is to restore the configuration or use `--reset`.
 
-This means applying a new migration to a partly loaded database prevents resuming it.
+Transient failures, such as timeouts, network errors, "too many parts" or memory limits, are retried up to
+`max_retries` times, waiting from 1 to 32 seconds. If a request fails after the server stored its rows, the retry
+duplicates them. The final count then reports a `Mismatch`, and the next run reloads that table.
 
 ## Testing
 
 ```bash
 scripts/cargo-docker.sh test --lib      # unit tests, no database
 
-scripts/provision-dwh.sh reporting_dwh_db_test
-DWH_TEST_DB_SOURCE='postgresql://postgres:postgres@dwh:5432/reporting_dwh_db_test?sslmode=disable' \
-  scripts/cargo-docker.sh test --test integration -- --test-threads=1
+docker compose up -d
+DBGEN_TEST_CLICKHOUSE_URL=http://dbgen:dbgen@localhost:18123 scripts/cargo-docker.sh test --test clickhouse
 ```
 
-Integration tests truncate their database, so they refuse any database whose name does not end in `_test`. Without
-`DWH_TEST_DB_SOURCE` they are skipped and report as passed.
-
-To measure encoding speed without a database:
-
-```bash
-scripts/cargo-docker.sh test --release --lib bench_encode -- --ignored --nocapture
-```
+The integration tests create, fill and drop databases named `dbgen_it_*_test`, and touch nothing else. They
+check the row encoding against the server, load the shop schema end to end, compare data across different batch
+sizes and worker counts, and resume after rows are lost. Without `DBGEN_TEST_CLICKHOUSE_URL` they are skipped and
+report as passed.
 
 ## Performance
 
-Measured on one workstation, with PostgreSQL inside a Docker Desktop VM limited to 3.6 GB of RAM. These are
-indications rather than a benchmark. All of them predate the current default of `table_concurrency: 1`, which has
-not been measured yet.
+One measurement so far, in `reports/reporting-test.json`: the `stress-1` volume (750,927 rows, 61 MiB) loaded
+into ClickHouse 26.8 in Docker with 4 workers and batches of 100,000 rows. The load took 0.9 seconds, about
+820,000 rows per second, and the whole command 2.1 seconds. Larger volumes have not been measured yet.
 
-| Run | Rows | Throughput |
-|---|---|---|
-| Encoding only, no database, one thread | | 0.7M rows/s (`fact_alarms`) to 12M rows/s (`fact_bed_status`) |
-| Full load, tables of a level interleaved | 2.28M | about 40,000 rows/s |
-| Level 5 of a resumed load, 2 tables at once | 1M | about 57,000 rows/s combined |
-| Level 4 of the same resumed load, 8 tables at once, integration tests running part of the time | 4.24M | about 12,000 rows/s, 30 deadlocks retried |
+Memory use is bounded by `(queue_depth + workers + generator_threads) × size of one encoded batch`.
 
-PostgreSQL is the bottleneck, not generation. Most of the contention observed comes from TimescaleDB creating chunks:
-each new chunk takes locks on its hypertable and on the dimensions it references, so hypertables loading at the same
-time block each other and sometimes deadlock. Deadlocks are retried, but cost time.
+## Known limitations
 
-Disk use was about 1.1 GB for the 8M-row dataset before compression. By extrapolation, not measurement, configs 5 and
-6 would need roughly 11 GB and 7 GB.
+- **ClickHouse only.** The SQL front end and the database layer are written to take more dialects, but none other
+  exists yet.
+- **Structure, not domain.** See [What the data guarantees](#what-the-data-guarantees).
+- **CHECK constraints using functions dbgen does not evaluate** are reported by `validate` and left to the
+  database. If the database then rejects a row, the load fails.
+- **Types dbgen cannot generate**, such as aggregate function states, are left NULL when nullable or to their
+  default when they have one. Otherwise validation fails.
+- **Keys with expression parts**, such as `ORDER BY toDate(ts)`, are not guaranteed unique. `validate` warns about
+  them.
+- **Referenced tables that are not generated** are read up to `max_existing_rows` rows each.
 
-## Documentation
+## Source
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how generation stays consistent and reproducible, the load pipeline,
-  what is exact and what is only statistical, known limitations.
-- [docs/SCHEMA.md](docs/SCHEMA.md): the DWH schema, the rules that live in ETL and BFF code, findings in the existing schema.
+Each module starts with a description of its part. [src/lib.rs](src/lib.rs) shows how they fit together.
