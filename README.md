@@ -32,6 +32,9 @@ bin/dbgen validate -c examples/shop/sqlite.yaml                      # check eve
 bin/dbgen generate -c examples/shop/sqlite.yaml --verify             # load, then check the result
 ```
 
+`generate` also runs the DDL itself when the database has none of its tables, so `apply` is needed only to create
+the database (`--create-database`) or to run the DDL without loading rows.
+
 For the other databases, `docker compose up -d` starts PostgreSQL on port 15432, MySQL on 13306 and ClickHouse on
 18123, and `examples/shop/postgres.yaml`, `mysql.yaml` and `clickhouse.yaml` point at them.
 
@@ -49,6 +52,7 @@ bin/dbgen init     -d postgres://dbgen:dbgen@localhost:15432/shop -o dbgen.yaml 
 |---|---|
 | `make build`, `make release` | Debug build; optimized build (opt-level 3, thin LTO, one codegen unit) to `bin/dbgen` |
 | `make release-native` | Optimized for this machine's CPU: faster, but may not run on other CPUs |
+| `make run ARGS="..."` | Builds if needed, then runs `bin/dbgen` with `ARGS`, e.g. `make run ARGS="validate -c dbgen.yaml"` (no `ARGS`: the help) |
 | `make test`, `make test-all` | Tests that need no server; every test, starting the test servers first |
 | `make lint`, `make doc` | Clippy and the API documentation, warnings as errors |
 | `make analyze`, `make security` | Every code analyzer; every security scanner (see [Code quality and security](#code-quality-and-security)) |
@@ -72,11 +76,11 @@ there (the resume state, SQLite databases) owned by you.
 
 | Command | What it does | Database |
 |---|---|---|
-| `inspect` | Prints the schema, and the generation plan when there are row targets. | Only to read the schema from it |
+| `inspect` | Prints the schema, and the generation plan when there are row targets. With `-o FILE`, also writes the schema's DDL to `FILE`. | Only to read the schema from it |
 | `init` | Writes a starting configuration that lists every table of the schema. | Only to read the schema from it |
 | `validate` | Checks the settings against the schema and the live database, generates sample rows, and prints the plan. Writes nothing. | Read |
 | `apply` | Runs every statement of the DDL files, in order. | Written |
-| `generate` | Loads the rows. Resumes automatically if a previous run was interrupted. | Written |
+| `generate` | Loads the rows. Resumes automatically if a previous run was interrupted. In a database that has none of the tables of the DDL files, runs the DDL first (see [In an empty database](#in-an-empty-database)). | Written |
 | `verify` | Checks the data in the database: row counts, unique keys, references and CHECK constraints. | Read |
 
 Every command reads its settings from a configuration file and from flags; a flag overrides the file's setting.
@@ -93,13 +97,14 @@ Every command reads its settings from a configuration file and from flags; a fla
 | | `--seed N`, `--history-days N`, `--end-time WHEN`, `--null-rate R` | the `generation` key of the same name |
 | | `--strict-tables` | `generation.missing_tables: error` |
 | Load (`generate`) | `--batch-size N`, `-w, --workers N`, `--table-concurrency N`, `--max-retries N`, `--state-file FILE` | the `generation` key of the same name |
-| Run | `--reset` (`generate`) | Empties every generated table first. **Destroys the data in those tables.** |
+| Run | `--fresh` (`generate`) | Empties every generated table first. **Destroys the data in those tables.** |
 | | `--dry-run` (`generate`) | Validates and prints the plan, then stops. |
 | | `--verify` (`generate`) | Runs the verification checks after a successful load. |
 | | `--report FILE` (`generate`, `verify`) | Writes the summary, or the check results, as JSON. |
 | | `--no-progress` (`generate`) | Prints periodic log lines instead of progress bars. |
 | | `--create-database` (`apply`) | Creates the database first if it does not exist. |
 | | `--json` (`inspect`) | Prints the schema as JSON. |
+| | `-o, --out FILE` (`inspect`) | Writes the schema's DDL to `FILE` as one SQL script, every statement in order under a comment naming its file. Creates missing directories and replaces an existing file. Read from the database (no `--schema`), it dumps the schema of a live database: `dbgen inspect -d URL -o schema.sql`. |
 | | `--rows N`, `-o FILE`, `--force` (`init`) | Rows to propose per table; where to write; overwrite. |
 
 Paths given as flags are relative to the current directory; paths in a configuration file are relative to the
@@ -186,6 +191,20 @@ Two other statements change how a table is treated:
 
 Every other statement, such as functions, triggers, views, grants or comments, is counted and ignored without
 being parsed. `inspect` lists them.
+
+#### In an empty database
+
+When the database has none of the tables the DDL files create, `generate` runs every statement of the files first,
+in order and as written, like `apply`: the migrations' `INSERT`s, views and triggers included. Then it loads the
+rows. The database itself must exist; `apply --create-database` creates it.
+
+- `validate` and `generate --dry-run` write nothing. They say that `generate` will create the schema, and check the
+  plan without the database. The rows of tables that are not generated, such as tables the DDL seeds, cannot be
+  read until the DDL has run, so references to them are left out of that check.
+- A database that holds some of the tables but not all is refused: running every statement again would fail on
+  the tables that exist. Bring it up to date with the DDL (the migrations it lacks), or empty it.
+- If a statement fails, the database keeps what the statements before it created, so the next run refuses it as
+  partial. Empty the database before running again.
 
 #### Without `schema`: the schema of the database
 
@@ -284,6 +303,37 @@ rows, a nullable child column is left NULL and a non-nullable one fails validati
 
 A table that references itself, such as `categories.parent_id`, gets a hierarchy without cycles: each row points
 at an earlier row, and the first row is a root (NULL), unless the column cannot be NULL.
+
+#### References that follow each other
+
+When a row references several tables and one of them leads to another through its own references, the second
+reference follows the first. A location that names a bed, a room and a floor gets the room of its bed and the floor
+of that room, so the three always agree, as they do in real data. Without this, each reference would pick its parent
+on its own, and a location's bed would rarely be in its room. `dbgen inspect` shows each such relation with the
+chain it follows:
+
+```
+dim_location.room_id -> dim_room.room_id     [inferred, follows dim_location.bed_id -> dim_bed.room_id]
+dim_location.floor_id -> dim_floor.floor_id  [inferred, follows dim_location.room_id -> dim_room.floor_id]
+```
+
+- The shortest chain wins. A chain through a `current_*` column, such as `dim_patient.current_bed_id`, describes the
+  parent's present state, which history rows need not share, so it is followed only when no other chain exists.
+- A reference that follows another is NULL only when the one it follows is NULL too: a location with a bed always
+  has a room, and a location without a bed may still have one.
+- When two references of a row lead to the same parent by equally short chains, dbgen follows the first and warns.
+- Chains go through generated tables. A reference that is part of a unique key enumerated without repeats, or that
+  references its own table, keeps its own picking.
+- The parent rows of a reference that follows another come from the chain, so its own `distribution` and `skew`
+  have no effect. Those of the reference it follows, and of the references along the chain, decide them.
+
+To choose the reference to follow, or to keep a reference on its own, declare the relation with `via`:
+
+```yaml
+relations:
+  - { from: "fact_patient_occupancy.bed_id", to: "dim_bed.bed_id", via: patient_key }   # the patient's current bed
+  - { from: "dim_location.room_id", to: "dim_room.room_id", via: none }                 # any room
+```
 
 ### `columns`
 
@@ -451,7 +501,7 @@ Run the same command again. Committed batches are kept, and only the rest are in
 
 dbgen refuses to resume if the seed, batch size, window, row targets, DDL, relations or column settings
 changed, and lists what differs. Without a state file, it refuses to write to generated tables that already hold
-rows. In both cases, the way out is to restore the configuration or use `--reset`.
+rows. In both cases, the way out is to restore the configuration or use `--fresh`.
 
 Transient failures, such as deadlocks, lock timeouts, lost connections, or ClickHouse's "too many parts" and
 memory limits, are retried up to `max_retries` times, waiting from 1 to 32 seconds. If a request fails after the

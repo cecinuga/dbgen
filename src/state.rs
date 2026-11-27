@@ -80,10 +80,10 @@ impl State {
             Err(e) => return Err(Error::Config(format!("cannot read resume state {}: {e}", path.display()))),
         };
         let mut s: State = serde_json::from_str(&text)
-            .map_err(|e| Error::Config(format!("resume state {} is corrupt ({e}); delete it and use --reset", path.display())))?;
+            .map_err(|e| Error::Config(format!("resume state {} is corrupt ({e}); delete it and use --fresh", path.display())))?;
         if s.format != FORMAT {
             return Err(Error::Config(format!(
-                "resume state {} has format {}, this dbgen writes {FORMAT}; delete it and use --reset",
+                "resume state {} has format {}, this dbgen writes {FORMAT}; delete it and use --fresh",
                 path.display(),
                 s.format
             )));

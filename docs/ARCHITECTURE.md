@@ -175,7 +175,7 @@ the resolved time window, the batch size, and the columnstore jobs paused for th
 
 The fingerprint covers model and generator version, seed, window, batch size, targets and schema
 version. If any changed, resuming would mix rows of two plans, so the run refuses and lists the
-differences. Rows without a matching state are refused as well, and `--reset` is the explicit way out.
+differences. Rows without a matching state are refused as well, and `--fresh` is the explicit way out.
 
 ### Columnstore policies
 

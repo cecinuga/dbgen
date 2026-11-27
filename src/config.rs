@@ -209,6 +209,31 @@ pub struct RelationConfig {
     pub to: ColumnRef,
     pub distribution: Distribution,
     pub skew: f64,
+    pub via: Via,
+}
+
+/// Whether a reference follows another reference of its row: a row that references a bed
+/// and a room gets the room of its bed, through the bed's own reference to its room.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Via {
+    /// Follows the other reference of the row that leads to the same parent, when one
+    /// does (`via` absent).
+    #[default]
+    Auto,
+    /// Picks its parent rows on its own (`via: none`).
+    Independent,
+    /// Follows the reference held by this child column (`via: bed_id`).
+    Column(String),
+}
+
+impl Via {
+    fn parse(s: Option<&str>) -> Via {
+        match s.map(str::trim) {
+            None => Via::Auto,
+            Some(s) if s.eq_ignore_ascii_case("none") => Via::Independent,
+            Some(s) => Via::Column(s.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -219,6 +244,7 @@ struct RawRelation {
     #[serde(default)]
     distribution: Distribution,
     skew: Option<f64>,
+    via: Option<String>,
 }
 
 /// Overrides for one column, under `columns: { table.column: {...} }`.
@@ -339,7 +365,13 @@ impl Config {
                 Yaml::String(s) => {
                     let (from, to) =
                         s.split_once("->").ok_or_else(|| Error::Config(format!("relations[{i}]: '{s}' is not 'child.col -> parent.col'")))?;
-                    RelationConfig { from: parse_ref(from, i)?, to: parse_ref(to, i)?, distribution: Distribution::Uniform, skew: 1.5 }
+                    RelationConfig {
+                        from: parse_ref(from, i)?,
+                        to: parse_ref(to, i)?,
+                        distribution: Distribution::Uniform,
+                        skew: 1.5,
+                        via: Via::Auto,
+                    }
                 }
                 other => {
                     let raw: RawRelation = serde_yaml_ng::from_value(other).map_err(|e| Error::Config(format!("relations[{i}]: {e}")))?;
@@ -348,6 +380,7 @@ impl Config {
                         to: parse_ref(&raw.to, i)?,
                         distribution: raw.distribution,
                         skew: raw.skew.unwrap_or(1.5),
+                        via: Via::parse(raw.via.as_deref()),
                     }
                 }
             };

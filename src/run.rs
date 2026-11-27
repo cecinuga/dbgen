@@ -63,8 +63,14 @@ fn log_warnings(schema: &Schema) {
 
 /// `dbgen inspect`: the schema, and the plan when there are row targets. Needs the
 /// database only when the schema is read from it.
-pub fn inspect(config: &Config, json: bool) -> Result<()> {
+/// With `out`, also writes the schema's DDL there as one SQL script ([`ddl_script`]),
+/// creating missing directories and replacing an existing file.
+pub fn inspect(config: &Config, json: bool, out: Option<&Path>) -> Result<()> {
     let schema = load_schema(config)?;
+    if let Some(path) = out {
+        write_file(path, &ddl_script(&schema))?;
+        eprintln!("Wrote the DDL ({} statements) to {}", schema.statements.len(), path.display());
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&schema).expect("serializable"));
         return Ok(());
@@ -76,6 +82,33 @@ pub fn inspect(config: &Config, json: bool) -> Result<()> {
         println!("(Without a database: rows of tables that are referenced but not generated are not read. `dbgen validate` reads them.)");
     }
     Ok(())
+}
+
+/// The DDL of a schema as one SQL script: every statement it was compiled from, in order
+/// and as written, each ending with `;`, under a comment naming the file it comes from.
+/// Compiling the script gives the same schema.
+pub fn ddl_script(schema: &Schema) -> String {
+    let mut s = format!("-- {} DDL written by `dbgen inspect`: {} statements.\n", schema.dialect.product(), schema.statements.len());
+    let mut current_source = None;
+    for st in &schema.statements {
+        // `at` is `source:line:column`, and a source name may itself contain colons.
+        let source = st.at.rsplitn(3, ':').nth(2).unwrap_or(&st.at);
+        if current_source != Some(source) {
+            let _ = write!(s, "\n-- {source}\n");
+            current_source = Some(source);
+        }
+        let _ = write!(s, "\n{};\n", st.sql.trim_end());
+    }
+    s
+}
+
+/// Writes `text` to `path`, creating missing directories and replacing an existing file.
+fn write_file(path: &Path, text: &str) -> Result<()> {
+    let cannot = |e: std::io::Error| Error::Config(format!("cannot write {}: {e}", path.display()));
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(cannot)?;
+    }
+    std::fs::write(path, text).map_err(cannot)
 }
 
 /// `dbgen init`: a starting configuration for the schema, every table listed with
@@ -211,6 +244,7 @@ pub fn render_schema(schema: &Schema) -> String {
 fn check_live(db: &Database, schema: &Schema, plan: &Plan) -> Result<()> {
     let live = db.live_columns().map_err(|e| e.into_error("reading the catalog"))?;
     let mut problems = Vec::new();
+    let mut missing_tables = false;
     for (ti, tp) in plan.tables.iter().enumerate() {
         let t = &schema.tables[ti];
         let generated = matches!(tp.mode, plan::Mode::Generate(_));
@@ -218,7 +252,8 @@ fn check_live(db: &Database, schema: &Schema, plan: &Plan) -> Result<()> {
             continue;
         }
         let Some(cols) = live.get(&t.name) else {
-            problems.push(format!("table {} does not exist in the database (`dbgen apply` creates the schema)", t.name));
+            problems.push(format!("table {} does not exist in the database", t.name));
+            missing_tables = true;
             continue;
         };
         if !generated {
@@ -239,7 +274,19 @@ fn check_live(db: &Database, schema: &Schema, plan: &Plan) -> Result<()> {
             }
         }
     }
-    if problems.is_empty() { Ok(()) } else { Err(Error::Validation(format!("the database does not match the DDL input:\n{}", bullets(&problems)))) }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    let mut message = format!("the database does not match the DDL input:\n{}", bullets(&problems));
+    if missing_tables {
+        // An empty database gets the schema from `generate` (see `lacks_schema`), so this
+        // one holds part of it, and running every statement again would fail.
+        message.push_str(
+            "\nthe database holds only part of the schema: `dbgen generate` creates the schema only in a database \
+             that has none of its tables; bring this one up to date with the DDL first, or empty it",
+        );
+    }
+    Err(Error::Validation(message))
 }
 
 fn bullets(items: &[String]) -> String {
@@ -259,19 +306,73 @@ struct Prepared {
     db: Database,
     plan: Plan,
     server_version: String,
+    /// The database has none of the schema's tables, and they were not created (the
+    /// command writes nothing): the plan was built without reading the database, and not
+    /// compared with it.
+    schema_pending: bool,
 }
 
-fn prepare(config: Config) -> Result<Prepared> {
+/// Connects, compiles the schema and builds the plan. With `create_schema`, a database
+/// that has none of the tables of the DDL files gets them first: every statement runs, in
+/// order, as `dbgen apply` would run them.
+fn prepare(config: Config, create_schema: bool) -> Result<Prepared> {
     let db = Database::connect(&config)?;
     tracing::info!(target = %db.describe(), "connecting");
     let server_version = server_version(&db)?;
     let schema = load_schema_with(&config, &db)?;
-    let plan = plan::build(&config, &schema, Some(&db))?;
+    let mut schema_pending = lacks_schema(&config, &db, &schema)?;
+    if schema_pending && create_schema {
+        tracing::info!(
+            tables = schema.tables.len(),
+            statements = schema.statements.len(),
+            "the database has none of the schema's tables: running the DDL"
+        );
+        let started = Instant::now();
+        run_ddl(&db, &schema, "creating the schema, ")?;
+        tracing::info!(seconds = %format!("{:.1}", started.elapsed().as_secs_f64()), "schema created");
+        schema_pending = false;
+    }
+    // Until the DDL runs, the tables the plan reads rather than generates (seeded by the
+    // DDL, for one) do not exist: the plan is built as without a database.
+    let rows: Option<&dyn plan::RowSource> = if schema_pending { None } else { Some(&db) };
+    let plan = plan::build(&config, &schema, rows)?;
     for w in &plan.warnings {
         tracing::warn!("{w}");
     }
-    check_live(&db, &schema, &plan)?;
-    Ok(Prepared { config, schema, db, plan, server_version })
+    if !schema_pending {
+        check_live(&db, &schema, &plan)?;
+    }
+    Ok(Prepared { config, schema, db, plan, server_version, schema_pending })
+}
+
+/// Whether the schema comes from DDL files and the database has none of its tables: an
+/// empty database, where `generate` runs the DDL before loading.
+fn lacks_schema(config: &Config, db: &Database, schema: &Schema) -> Result<bool> {
+    if config.schema.is_empty() || schema.tables.is_empty() {
+        return Ok(false);
+    }
+    let live = db.live_columns().map_err(|e| e.into_error("reading the catalog"))?;
+    Ok(!schema.tables.iter().any(|t| live.contains_key(&t.name)))
+}
+
+/// What `validate` and `generate --dry-run` say about a database that `generate` would
+/// create the schema in.
+fn pending_schema_note(schema: &Schema) -> String {
+    format!(
+        "The database has none of the schema's tables: `dbgen generate` creates them first, running the {} statements \
+         of the DDL. Until then, the rows of the tables that are not generated (such as tables the DDL seeds) cannot \
+         be read, so the plan below leaves references to them out.",
+        schema.statements.len()
+    )
+}
+
+/// Runs every statement of the DDL against the database, in order, as written. Errors
+/// name the statement after `context`.
+fn run_ddl(db: &Database, schema: &Schema, context: &str) -> Result<()> {
+    for (k, st) in schema.statements.iter().enumerate() {
+        db.execute(&st.sql).map_err(|e| e.into_error(&format!("{context}statement {} at {}", k + 1, st.at)))?;
+    }
+    Ok(())
 }
 
 /// Generates sample rows of every table, so CHECKs that cannot be satisfied are found
@@ -299,8 +400,11 @@ fn check_samples(plan: &Plan) -> Result<String> {
 
 /// `dbgen validate`: everything short of writing.
 pub fn validate(config: Config) -> Result<()> {
-    let p = prepare(config)?;
+    let p = prepare(config, false)?;
     println!("Database: {} ({} {})", p.db.describe(), p.db.dialect().product(), p.server_version);
+    if p.schema_pending {
+        println!("{}\n", pending_schema_note(&p.schema));
+    }
     println!("{}", p.plan.render(&p.schema));
     println!("{}", check_samples(&p.plan)?);
     println!("Total rows to generate: {}", crate::report::thousands(p.plan.total_rows()));
@@ -324,9 +428,7 @@ pub fn apply_config(config: &Config, create_database: bool) -> Result<()> {
     }
     server_version(&db)?;
     let started = Instant::now();
-    for (k, st) in schema.statements.iter().enumerate() {
-        db.execute(&st.sql).map_err(|e| e.into_error(&format!("statement {} at {}", k + 1, st.at)))?;
-    }
+    run_ddl(&db, &schema, "")?;
     println!("Applied {} statements to {} in {:.1}s", schema.statements.len(), db.describe(), started.elapsed().as_secs_f64());
     Ok(())
 }
@@ -362,12 +464,17 @@ pub fn generate(opts: GenerateOptions) -> Result<Outcome> {
     generate_config(config, &opts)
 }
 
-/// `dbgen generate`: loads the configured rows, resuming an interrupted run.
+/// `dbgen generate`: loads the configured rows, resuming an interrupted run. A database
+/// that has none of the tables of the DDL files gets them first (see [`prepare`]); a dry
+/// run only says so.
 pub fn generate_config(config: Config, opts: &GenerateOptions) -> Result<Outcome> {
     let started = Instant::now();
-    let p = prepare(config)?;
+    let p = prepare(config, !opts.dry_run)?;
     let samples = check_samples(&p.plan)?;
     if opts.dry_run {
+        if p.schema_pending {
+            println!("{}\n", pending_schema_note(&p.schema));
+        }
         println!("{}", p.plan.render(&p.schema));
         println!("{samples}");
         return Ok(Outcome { summary: None, verification: None, error: None });
@@ -448,7 +555,7 @@ pub fn generate_config(config: Config, opts: &GenerateOptions) -> Result<Outcome
     Ok(Outcome { summary: Some(summary), verification, error })
 }
 
-/// The state to load with: fresh after `--reset` or on an empty database, or the state
+/// The state to load with: a new one after `--fresh` or on an empty database, or the state
 /// of the interrupted run to resume. Generated tables whose rows do not match the state
 /// are emptied, with the tables that reference them when the database checks foreign keys.
 fn resume_state(p: &Prepared, fingerprint: &str, state_path: &Path, reset: bool) -> Result<State> {
@@ -473,7 +580,7 @@ fn resume_state(p: &Prepared, fingerprint: &str, state_path: &Path, reset: bool)
 
     if reset {
         truncate(&generated.iter().map(|(_, n)| *n).collect::<Vec<_>>())?;
-        tracing::info!(tables = generated.len(), "reset: generated tables emptied");
+        tracing::info!(tables = generated.len(), "fresh start: generated tables emptied");
         return Ok(fresh);
     }
     let Some(mut old) = State::load(state_path)? else {
@@ -486,7 +593,7 @@ fn resume_state(p: &Prepared, fingerprint: &str, state_path: &Path, reset: bool)
         }
         if !busy.is_empty() {
             return Err(Error::Validation(format!(
-                "tables to generate already hold rows dbgen did not write: {}\nuse --reset to empty them first",
+                "tables to generate already hold rows dbgen did not write: {}\nuse --fresh to empty them first",
                 busy.join(", ")
             )));
         }
@@ -495,7 +602,7 @@ fn resume_state(p: &Prepared, fingerprint: &str, state_path: &Path, reset: bool)
     let diffs = old.differences(&fresh);
     if !diffs.is_empty() {
         return Err(Error::Validation(format!(
-            "{} holds a run with different settings; restore them, or start over with --reset:\n{}",
+            "{} holds a run with different settings; restore them, or start over with --fresh:\n{}",
             state_path.display(),
             bullets(&diffs)
         )));
@@ -543,4 +650,27 @@ pub fn verify_only(config: &Config, report: Option<&Path>) -> Result<bool> {
         write_json(path, &results)?;
     }
     Ok(verify::all_passed(&results))
+}
+
+#[cfg(all(test, feature = "clickhouse"))]
+mod tests {
+    use super::*;
+    use crate::dialect::Dialect;
+
+    #[test]
+    fn ddl_script_compiles_back_to_the_same_schema() {
+        let sources = [
+            Source::new("m/001.sql", "CREATE TABLE t (id UInt32) ENGINE = MergeTree ORDER BY id; -- note\nINSERT INTO t VALUES (1)".into()),
+            Source::new("m/002.sql", "ALTER TABLE t ADD COLUMN x Nullable(String);\nOPTIMIZE TABLE t FINAL;".into()),
+        ];
+        let schema = schema::compile(Dialect::Clickhouse, &sources).unwrap();
+        let script = ddl_script(&schema);
+        assert!(script.contains("\n-- m/001.sql\n") && script.contains("\n-- m/002.sql\n"), "{script}");
+        assert_eq!(script.matches(";\n").count(), 4, "{script}");
+
+        let again = schema::compile(Dialect::Clickhouse, &[Source::new("dump.sql", script)]).unwrap();
+        let shape = |s: &Schema| s.tables.iter().map(|t| (t.name.clone(), t.seeded, t.columns.iter().map(|c| (c.name.clone(), c.ty.to_string())).collect::<Vec<_>>())).collect::<Vec<_>>();
+        assert_eq!(shape(&again), shape(&schema));
+        assert_eq!(again.statements.len(), schema.statements.len());
+    }
 }

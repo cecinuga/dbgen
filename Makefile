@@ -2,8 +2,9 @@
 #
 # Cargo runs on the host when it is at least Rust 1.100 (the crate's rust-version),
 # otherwise inside Docker through scripts/cargo-docker.sh. Force either with
-# `make CARGO=cargo ...` or `make CARGO=scripts/cargo-docker.sh ...`. Analyzers that are not installed are fetched
-# on first use: cargo tools with `cargo install`, the others as Docker images or with npx.
+# `make CARGO=cargo ...` or `make CARGO=scripts/cargo-docker.sh ...`. Analyzers that are
+# not installed are fetched on first use: cargo tools with `cargo install`, the others as
+# Docker images or with npx.
 
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
@@ -18,6 +19,8 @@ MYSQL_URL ?= mysql://root:dbgen@localhost:13306
 CH_URL ?= http://dbgen:dbgen@localhost:18123
 SERVERS := DBGEN_TEST_POSTGRES_URL=$(PG_URL) DBGEN_TEST_MYSQL_URL=$(MYSQL_URL) DBGEN_TEST_CLICKHOUSE_URL=$(CH_URL)
 
+# Arguments of `make run`.
+ARGS ?= --help
 IMAGE ?= dbgen
 PREFIX ?= $(HOME)/.local
 PRETTIER ?= $(if $(shell command -v npx 2>/dev/null),npx --yes prettier@3,docker run --rm -v "$(CURDIR):/work" -w /work node:22-alpine npx --yes prettier@3)
@@ -36,7 +39,7 @@ define copy_binary
 	@echo "Binary: bin/dbgen"
 endef
 
-.PHONY: help build release release-native image install clean \
+.PHONY: help build release release-native run image install clean \
 	test test-unit test-all test-postgres test-mysql test-sqlite test-clickhouse db-up db-down demo \
 	fmt fmt-check prettier prettier-check lint lint-features doc \
 	audit deny machete trivy trivy-image secrets analyze security ci
@@ -58,6 +61,9 @@ release: ## Optimized build (opt-level 3, thin LTO, one codegen unit) to bin/dbg
 release-native: ## Optimized for this machine's CPU (faster, may not run on other CPUs)
 	RUSTFLAGS="-C target-cpu=native" $(CARGO) build --release
 	$(copy_binary)
+
+run: release ## Build, then run dbgen with ARGS: make run ARGS="validate -c dbgen.yaml"
+	bin/dbgen $(ARGS)
 
 image: ## Self-contained Docker image (IMAGE=dbgen)
 	docker build -t $(IMAGE) .
@@ -103,7 +109,7 @@ db-down: ## Stop the test servers (their data volumes are kept)
 
 demo: release ## Load the shop example into SQLite and verify it
 	bin/dbgen apply -c examples/shop/sqlite.yaml --create-database
-	bin/dbgen generate -c examples/shop/sqlite.yaml --reset --verify
+	bin/dbgen generate -c examples/shop/sqlite.yaml --fresh --verify
 
 ## Code quality
 

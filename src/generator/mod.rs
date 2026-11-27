@@ -147,6 +147,14 @@ pub enum Pick {
         key: usize,
         comp: usize,
     },
+    /// Follows other references: the parent row that relation `root` picks for the child
+    /// row, then the parent row each relation of `hops` picks for that row, in order. A
+    /// row referencing a bed and a room gets the room of its bed (`root` the bed, `hops`
+    /// the bed's reference to its room), so the two agree.
+    Via {
+        root: usize,
+        hops: Vec<usize>,
+    },
 }
 
 /// A relation between generated tables, or to rows read from the database.
@@ -250,6 +258,9 @@ impl World {
             Pick::Earlier if i == 0 => 0,
             Pick::Earlier => Rng::at(&[self.seed, rel.tag, i, PICK_STREAM]).below(i.min(n)),
             Pick::Product { key, comp } => self.product_index(*key, *comp, i),
+            Pick::Via { root, hops } => {
+                hops.iter().fold(self.parent_row(&self.relations[*root], i), |row, &h| self.parent_row(&self.relations[h], row))
+            }
         }
     }
 
@@ -289,6 +300,23 @@ impl TableGen {
         c.nullable && c.null_rate > 0.0 && unit(hash(&[self.seed, self.tag, c.tag, i, NULL_STREAM])) < c.null_rate
     }
 
+    /// Whether reference column `col` of row `i` is drawn NULL. One that follows another
+    /// reference of the row ([`Pick::Via`]) is NULL only if that one is too: a row whose
+    /// bed is known has a known room, and a row without a bed may still have a room.
+    fn ref_null_draw(&self, w: &World, col: usize, i: u64) -> bool {
+        if !self.null_draw(col, i) {
+            return false;
+        }
+        let Strategy::Ref { rel, .. } = &self.cols[col].strategy else { return true };
+        match &w.relations[*rel].pick {
+            Pick::Via { root, .. } => {
+                let followed = w.relations[*root].child_cols[0];
+                self.cols[followed].nullable && self.ref_null_draw(w, followed, i)
+            }
+            _ => true,
+        }
+    }
+
     /// The value of a column that does not depend on other columns of the row.
     fn base_value(&self, w: &World, col: usize, i: u64, state: &ColState) -> Value {
         let (variant, null) = match state {
@@ -306,7 +334,7 @@ impl TableGen {
                 // The first row of a table that references itself has no earlier row: it
                 // is a root of the hierarchy, unless the column cannot be NULL.
                 let root = i == 0 && matches!(r.pick, Pick::Earlier);
-                if c.nullable && (root || is_null()) {
+                if c.nullable && (root || null.unwrap_or_else(|| self.ref_null_draw(w, col, i))) {
                     return Value::Null;
                 }
                 w.parent_value(r, w.parent_row(r, i), *part)

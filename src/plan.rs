@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
-use crate::config::{ColumnConfig, Config, Distribution, MissingTables, TableTarget, yaml_str};
+use crate::config::{ColumnConfig, Config, Distribution, MissingTables, TableTarget, Via, yaml_str};
 use crate::error::{Error, Result};
 use crate::expr::{CExpr, Compiler, EvalCtx, cast};
 use crate::generator::domain::{self, Domain, TextKind, Unique, default_domain, domain_nth, domain_size};
@@ -22,7 +22,8 @@ use crate::value::Value;
 /// a resume across versions is refused.
 ///
 /// 2: a table that references itself points at earlier rows only.
-pub const MODEL_VERSION: u32 = 2;
+/// 3: a reference that another reference of the row leads to follows it.
+pub const MODEL_VERSION: u32 = 3;
 
 /// What the load does with a table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +54,9 @@ pub struct RelationInfo {
     pub parent_cols: Vec<String>,
     /// Where it was found: `config`, `ddl` or `inferred`.
     pub source: &'static str,
+    /// The references it follows, when another reference of the row leads to its parent:
+    /// `dim_location.bed_id -> dim_bed.room_id`.
+    pub through: Option<String>,
 }
 
 /// Everything needed to generate and load the data, validated.
@@ -94,6 +98,7 @@ struct RelDraft {
     source: &'static str,
     distribution: Distribution,
     skew: f64,
+    via: Via,
 }
 
 impl RelDraft {
@@ -105,6 +110,7 @@ impl RelDraft {
             parent: parent.name.clone(),
             parent_cols: self.parent_cols.iter().map(|&c| parent.columns[c].name.clone()).collect(),
             source: self.source,
+            through: None,
         }
     }
 }
@@ -142,13 +148,14 @@ pub fn build(config: &Config, schema: &Schema, rows: Option<&dyn RowSource>) -> 
     }
     make_referenced_keys_unique(&mut world, g.seed, window);
     resolve_references_to_empty_tables(&mut world, schema, &tables, rows.is_some(), &mut found);
+    let through = follow_chains(&mut world, schema, &drafts, &mut found);
     check_reference_ranges(&world, &mut found.problems);
     detect_cycles(&world, schema, &mut found.problems);
     if !found.problems.is_empty() {
         return Err(Error::Validation(found.problems.iter().map(|p| format!("  - {p}")).collect::<Vec<_>>().join("\n")));
     }
 
-    let relations = drafts.iter().map(|d| d.info(schema)).collect();
+    let relations = drafts.iter().zip(through).map(|(d, through)| RelationInfo { through, ..d.info(schema) }).collect();
     let levels = load_levels(&world, &tables);
     let order = levels.concat();
     Ok(Plan { world, tables, relations, window, warnings: found.warnings, order, levels })
@@ -239,7 +246,16 @@ fn find_relations(config: &Config, schema: &Schema, generated: &[bool], found: &
         }
         if generated[ci] {
             covered.extend(child_cols.iter().map(|&c| (ci, c)));
-            drafts.push(RelDraft { child: ci, child_cols, parent: pi, parent_cols, source: "config", distribution: rc.distribution, skew: rc.skew });
+            drafts.push(RelDraft {
+                child: ci,
+                child_cols,
+                parent: pi,
+                parent_cols,
+                source: "config",
+                distribution: rc.distribution,
+                skew: rc.skew,
+                via: rc.via.clone(),
+            });
         }
     }
 
@@ -275,7 +291,16 @@ fn find_relations(config: &Config, schema: &Schema, generated: &[bool], found: &
                 continue;
             }
             covered.extend(child_cols.iter().map(|&c| (ci, c)));
-            drafts.push(RelDraft { child: ci, child_cols, parent: pi, parent_cols, source: "ddl", distribution: Distribution::Uniform, skew: 1.5 });
+            drafts.push(RelDraft {
+                child: ci,
+                child_cols,
+                parent: pi,
+                parent_cols,
+                source: "ddl",
+                distribution: Distribution::Uniform,
+                skew: 1.5,
+                via: Via::Auto,
+            });
         }
         if config.generation.infer_relations {
             drafts.extend(infer_relations(config, schema, ci, &mut covered, &is_ignored));
@@ -334,6 +359,7 @@ fn infer_relations(
             source: "inferred",
             distribution: Distribution::Uniform,
             skew: 1.5,
+            via: Via::Auto,
         })
         .collect()
 }
@@ -426,6 +452,200 @@ fn resolve_references_to_empty_tables(world: &mut World, schema: &Schema, tables
             ));
         }
     }
+}
+
+/// The most references a chain followed by [`follow_chains`] goes through.
+const MAX_HOPS: usize = 6;
+
+/// References that another reference of the row leads to follow it ([`Pick::Via`]). A row
+/// that references a bed, a room and a floor gets the room of its bed and the floor of
+/// that room, through the bed's and the room's own references, instead of drawing each
+/// on its own. Returns, per relation, the chain it follows, for display.
+///
+/// Relation `r` follows relation `a` of the same row when the parent of `a` leads to the
+/// parent of `r` through references whose child columns hold the rows their relations
+/// pick. The shortest chain wins, and chains through a `current_*` column (the parent's
+/// present state, which history rows need not share) only when there is no other. `via`
+/// in the configuration names the reference to follow, or `none` to keep `r` on its own.
+/// A reference that is part of a unique key enumerated without repeats keeps its
+/// enumeration.
+fn follow_chains(world: &mut World, schema: &Schema, drafts: &[RelDraft], found: &mut Findings) -> Vec<Option<String>> {
+    let n = world.relations.len();
+    let steps: Vec<bool> = (0..n).map(|r| holds_pick(world, r)).collect();
+    let mut by_child: HashMap<usize, Vec<usize>> = HashMap::new();
+    for r in (0..n).filter(|&r| steps[r]) {
+        by_child.entry(world.relations[r].child).or_default().push(r);
+    }
+    let rel_name = |world: &World, r: usize| {
+        let rel = &world.relations[r];
+        let t = &schema.tables[rel.child];
+        format!("{}.{}", t.name, names(t, &rel.child_cols))
+    };
+    // Automatic choices that had an equally good alternative: (relation, alternatives).
+    let mut ties: Vec<(usize, Vec<usize>)> = Vec::new();
+    for r in 0..n {
+        if drafts[r].via == Via::Independent {
+            continue;
+        }
+        let rel = &world.relations[r];
+        let (child, parent) = (rel.child, rel.parent);
+        let followable = steps[r] && matches!(rel.pick, Pick::Uniform | Pick::Skewed { .. });
+        let wanted = match &drafts[r].via {
+            Via::Column(name) => Some(name.as_str()),
+            _ => None,
+        };
+        let mut candidates: Vec<(usize, Vec<usize>, (usize, usize))> = Vec::new();
+        if followable {
+            for &a in by_child.get(&child).into_iter().flatten() {
+                let ra = &world.relations[a];
+                if a == r || ra.parent == parent {
+                    continue;
+                }
+                if wanted.is_some_and(|w| !ra.child_cols.iter().any(|&c| schema.tables[child].columns[c].name == w)) {
+                    continue;
+                }
+                let Some((hops, cost)) = chain(world, schema, &by_child, ra.parent, parent, child) else { continue };
+                // Following `a` must not make `a` or a step depend on `r` again.
+                let mut deps = hops.clone();
+                deps.push(a);
+                if !follows_any(world, &deps, r) {
+                    candidates.push((a, hops, cost));
+                }
+            }
+        }
+        let Some(best) = candidates.iter().map(|c| c.2).min() else {
+            if let Some(w) = wanted {
+                let t = &schema.tables[child];
+                let why = if !followable {
+                    "the reference cannot follow another: it is part of a unique key enumerated without repeats, references its own table, or is not generated as a reference".to_string()
+                } else if t.column_index(w).is_none() {
+                    format!("{} has no column {w}", t.name)
+                } else {
+                    format!("{w} is not a reference of {} that leads to {}", t.name, schema.tables[parent].name)
+                };
+                found.problems.push(format!("relation {}: via {w}: {why}", rel_name(world, r)));
+            }
+            continue;
+        };
+        let mut best_ones = candidates.into_iter().filter(|c| c.2 == best);
+        let (a, hops, _) = best_ones.next().expect("a best candidate");
+        let others: Vec<usize> = best_ones.map(|c| c.0).collect();
+        if wanted.is_none() && !others.is_empty() {
+            ties.push((r, others));
+        }
+        world.relations[r].pick = Pick::Via { root: a, hops };
+    }
+    for (r, others) in ties {
+        let Pick::Via { root, .. } = world.relations[r].pick else { continue };
+        for other in others {
+            // Alternatives on the same chain lead to the same parent row.
+            if follows_any(world, &[other], root) || follows_any(world, &[root], other) {
+                continue;
+            }
+            found.warnings.push(format!(
+                "{} follows {}, but {} leads to {} too: declare the relation with `via` to choose",
+                rel_name(world, r),
+                chain_text(world, schema, r, true),
+                rel_name(world, other),
+                schema.tables[world.relations[r].parent].name
+            ));
+        }
+    }
+    let mut through = vec![None; n];
+    for r in 0..n {
+        if !matches!(world.relations[r].pick, Pick::Via { .. }) {
+            continue;
+        }
+        through[r] = Some(chain_text(world, schema, r, true));
+        let ti = world.relations[r].child;
+        for &c in &world.relations[r].child_cols.clone() {
+            let text = describe(&world.table(ti).cols[c], world, schema, ti);
+            world.tables[ti].as_mut().expect("generated child").cols[c].describe = text;
+        }
+    }
+    through
+}
+
+/// Whether the child columns of relation `r` hold the parent row it picks, so a chain can
+/// go through it: they are generated as that reference, and the parent has rows.
+fn holds_pick(world: &World, r: usize) -> bool {
+    let rel = &world.relations[r];
+    rel.child != rel.parent
+        && rel.parent_rows > 0
+        && world.tables[rel.child]
+            .as_ref()
+            .is_some_and(|t| rel.child_cols.iter().all(|&c| matches!(t.cols[c].strategy, Strategy::Ref { rel: x, .. } if x == r)))
+}
+
+/// The best chain of references from table `start` to table `goal` that avoids table
+/// `avoid`, with its cost: `(references through current_* columns, references)`.
+fn chain(
+    world: &World,
+    schema: &Schema,
+    by_child: &HashMap<usize, Vec<usize>>,
+    start: usize,
+    goal: usize,
+    avoid: usize,
+) -> Option<(Vec<usize>, (usize, usize))> {
+    let is_current = |h: usize| {
+        let rel = &world.relations[h];
+        schema.tables[rel.child].columns[rel.child_cols[0]].name.to_ascii_lowercase().starts_with("current_")
+    };
+    let mut best: HashMap<usize, ((usize, usize), Vec<usize>)> = HashMap::from([(start, ((0, 0), Vec::new()))]);
+    let mut frontier: BTreeSet<((usize, usize), usize)> = BTreeSet::from([((0, 0), start)]);
+    while let Some((cost, at)) = frontier.pop_first() {
+        if best[&at].0 < cost {
+            continue;
+        }
+        if at == goal {
+            return Some((best[&at].1.clone(), cost));
+        }
+        for &h in by_child.get(&at).into_iter().flatten() {
+            let next = world.relations[h].parent;
+            let c = (cost.0 + usize::from(is_current(h)), cost.1 + 1);
+            if next == avoid || c.1 > MAX_HOPS || best.get(&next).is_some_and(|(b, _)| *b <= c) {
+                continue;
+            }
+            let mut path = best[&at].1.clone();
+            path.push(h);
+            best.insert(next, (c, path));
+            frontier.insert((c, next));
+        }
+    }
+    None
+}
+
+/// Whether any relation of `from`, or a relation it follows, is relation `target`.
+fn follows_any(world: &World, from: &[usize], target: usize) -> bool {
+    let mut stack = from.to_vec();
+    let mut seen = HashSet::new();
+    while let Some(x) = stack.pop() {
+        if x == target {
+            return true;
+        }
+        if seen.insert(x)
+            && let Pick::Via { root, hops } = &world.relations[x].pick
+        {
+            stack.push(*root);
+            stack.extend(hops);
+        }
+    }
+    false
+}
+
+/// The references relation `r` follows: `bed_id -> dim_bed.room_id`, with the child
+/// table first when `qualified`.
+fn chain_text(world: &World, schema: &Schema, r: usize, qualified: bool) -> String {
+    let Pick::Via { root, hops } = &world.relations[r].pick else { return String::new() };
+    let rr = &world.relations[*root];
+    let t = &schema.tables[rr.child];
+    let mut s = if qualified { format!("{}.{}", t.name, names(t, &rr.child_cols)) } else { names(t, &rr.child_cols) };
+    for &h in hops {
+        let hr = &world.relations[h];
+        let ht = &schema.tables[hr.child];
+        let _ = write!(s, " -> {}.{}", ht.name, names(ht, &hr.child_cols));
+    }
+    s
 }
 
 /// References must fit the child column: a parent sequence can outgrow a narrower type.
@@ -1192,11 +1412,12 @@ fn describe(col: &ColGen, world: &World, schema: &Schema, ti: usize) -> String {
             let r = &world.relations[*rel];
             let p = &schema.tables[r.parent];
             let how = match r.pick {
-                Pick::Uniform => "",
-                Pick::Skewed { .. } => ", skewed",
-                Pick::Injective(_) => ", one-to-one",
-                Pick::Earlier => ", an earlier row",
-                Pick::Product { .. } => ", combinations without repeats",
+                Pick::Uniform => String::new(),
+                Pick::Skewed { .. } => ", skewed".into(),
+                Pick::Injective(_) => ", one-to-one".into(),
+                Pick::Earlier => ", an earlier row".into(),
+                Pick::Product { .. } => ", combinations without repeats".into(),
+                Pick::Via { .. } => format!(" through {}", chain_text(world, schema, *rel, false)),
             };
             format!("references {}.{}{how}", p.name, p.columns[r.parent_cols[*part]].name)
         }
@@ -1456,7 +1677,10 @@ impl Plan {
             for r in &self.relations {
                 let cc = if r.child_cols.len() == 1 { r.child_cols[0].clone() } else { format!("({})", r.child_cols.join(", ")) };
                 let pc = if r.parent_cols.len() == 1 { r.parent_cols[0].clone() } else { format!("({})", r.parent_cols.join(", ")) };
-                let _ = writeln!(s, "  {}.{cc} -> {}.{pc}   [{}]", r.child, r.parent, r.source);
+                match &r.through {
+                    Some(t) => _ = writeln!(s, "  {}.{cc} -> {}.{pc}   [{}, follows {t}]", r.child, r.parent, r.source),
+                    None => _ = writeln!(s, "  {}.{cc} -> {}.{pc}   [{}]", r.child, r.parent, r.source),
+                }
             }
         }
         for (ti, tg) in self.generated() {
@@ -1476,5 +1700,146 @@ impl Plan {
             }
         }
         s
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod chain_tests {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    use super::*;
+    use crate::sql::Source;
+
+    /// Floors, rooms on a floor, beds in a room, and locations that name a bed, its room
+    /// and that room's floor, as a hospital's dimensions do.
+    const WARD: &str = "
+        CREATE TABLE floors (floor_id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE rooms (room_id INTEGER PRIMARY KEY, floor_id INTEGER NOT NULL REFERENCES floors (floor_id));
+        CREATE TABLE beds (bed_id INTEGER PRIMARY KEY, room_id INTEGER NOT NULL REFERENCES rooms (room_id));
+        CREATE TABLE locations (
+            location_id INTEGER PRIMARY KEY,
+            bed_id INTEGER REFERENCES beds (bed_id),
+            room_id INTEGER REFERENCES rooms (room_id),
+            floor_id INTEGER NOT NULL REFERENCES floors (floor_id)
+        );
+        CREATE TABLE patients (patient_id INTEGER PRIMARY KEY, current_bed_id INTEGER NOT NULL REFERENCES beds (bed_id));
+        CREATE TABLE stays (
+            stay_id INTEGER PRIMARY KEY,
+            patient_id INTEGER NOT NULL REFERENCES patients (patient_id),
+            location_id INTEGER NOT NULL REFERENCES locations (location_id),
+            bed_id INTEGER NOT NULL REFERENCES beds (bed_id)
+        );
+    ";
+
+    const TABLES: &str = "
+generation: { seed: 11, null_rate: 0.3 }
+tables: { floors: 3, rooms: 12, beds: 40, locations: 400, patients: 30, stays: 600 }
+";
+
+    fn plan(extra: &str) -> Result<(Schema, Plan)> {
+        let config = Config::parse(&format!("dialect: sqlite\n{TABLES}{extra}"), Path::new("ward.yaml"))?;
+        let schema = crate::schema::compile(config.dialect, &[Source::new("ward.sql", WARD.into())])?;
+        let plan = build(&config, &schema, None)?;
+        Ok((schema, plan))
+    }
+
+    /// Every row of `table`, by column name.
+    fn rows(schema: &Schema, plan: &Plan, table: &str) -> Vec<HashMap<String, Value>> {
+        let ti = schema.table_index(table).unwrap();
+        let tg = plan.world.table(ti);
+        let mut row = Row::new();
+        (0..tg.rows)
+            .map(|i| {
+                tg.row(&plan.world, i, &mut row).unwrap();
+                schema.tables[ti].columns.iter().map(|c| c.name.clone()).zip(row.values.iter().cloned()).collect()
+            })
+            .collect()
+    }
+
+    /// `key -> value` over the rows of `table`.
+    fn lookup(schema: &Schema, plan: &Plan, table: &str, key: &str, value: &str) -> HashMap<String, Value> {
+        rows(schema, plan, table).into_iter().map(|r| (r[key].to_string(), r[value].clone())).collect()
+    }
+
+    fn through<'a>(plan: &'a Plan, child: &str, col: &str) -> Option<&'a str> {
+        plan.relations.iter().find(|r| r.child == child && r.child_cols == [col]).and_then(|r| r.through.as_deref())
+    }
+
+    #[test]
+    fn references_follow_the_chain_of_their_row() {
+        let (schema, plan) = plan("").unwrap();
+        assert_eq!(through(&plan, "locations", "room_id"), Some("locations.bed_id -> beds.room_id"));
+        assert_eq!(through(&plan, "locations", "floor_id"), Some("locations.room_id -> rooms.floor_id"));
+        assert_eq!(through(&plan, "locations", "bed_id"), None);
+
+        let room_of_bed = lookup(&schema, &plan, "beds", "bed_id", "room_id");
+        let floor_of_room = lookup(&schema, &plan, "rooms", "room_id", "floor_id");
+        let (mut with_bed, mut room_without_bed) = (0, 0);
+        for l in rows(&schema, &plan, "locations") {
+            if !l["bed_id"].is_null() {
+                with_bed += 1;
+                assert_eq!(l["room_id"], room_of_bed[&l["bed_id"].to_string()], "a location's room is the room of its bed: {l:?}");
+            } else if !l["room_id"].is_null() {
+                room_without_bed += 1;
+            }
+            if !l["room_id"].is_null() {
+                assert_eq!(l["floor_id"], floor_of_room[&l["room_id"].to_string()], "a location's floor is the floor of its room: {l:?}");
+            }
+        }
+        // NULL bed (30%) leaves the room to its own draw: some locations are rooms.
+        assert!(with_bed > 200 && room_without_bed > 50, "{with_bed} with a bed, {room_without_bed} rooms without one");
+    }
+
+    #[test]
+    fn current_columns_are_followed_only_without_another_chain() {
+        let (schema, plan) = plan("").unwrap();
+        // Both the patient (through current_bed_id) and the location lead to a bed.
+        assert_eq!(through(&plan, "stays", "bed_id"), Some("stays.location_id -> locations.bed_id"));
+        assert!(plan.warnings.iter().all(|w| !w.contains("stays.bed_id")), "{:?}", plan.warnings);
+        let bed_of_location = lookup(&schema, &plan, "locations", "location_id", "bed_id");
+        for s in rows(&schema, &plan, "stays") {
+            let bed = &bed_of_location[&s["location_id"].to_string()];
+            if !bed.is_null() {
+                assert_eq!(&s["bed_id"], bed, "{s:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn via_chooses_the_reference_to_follow() {
+        let (schema, plan) = plan("relations: [{ from: stays.bed_id, to: beds.bed_id, via: patient_id }]\n").unwrap();
+        assert_eq!(through(&plan, "stays", "bed_id"), Some("stays.patient_id -> patients.current_bed_id"));
+        let current_bed = lookup(&schema, &plan, "patients", "patient_id", "current_bed_id");
+        for s in rows(&schema, &plan, "stays") {
+            assert_eq!(s["bed_id"], current_bed[&s["patient_id"].to_string()], "{s:?}");
+        }
+    }
+
+    #[test]
+    fn via_none_keeps_a_reference_on_its_own() {
+        let (schema, plan) = plan("relations: [{ from: locations.room_id, to: rooms.room_id, via: none }]\n").unwrap();
+        assert_eq!(through(&plan, "locations", "room_id"), None);
+        let room_of_bed = lookup(&schema, &plan, "beds", "bed_id", "room_id");
+        let mismatched = rows(&schema, &plan, "locations")
+            .iter()
+            .filter(|l| !l["bed_id"].is_null() && !l["room_id"].is_null() && l["room_id"] != room_of_bed[&l["bed_id"].to_string()])
+            .count();
+        assert!(mismatched > 100, "independent rooms rarely match the bed's: {mismatched}");
+    }
+
+    #[test]
+    fn via_that_leads_nowhere_is_refused() {
+        let e = plan("relations: [{ from: stays.bed_id, to: beds.bed_id, via: stay_id }]\n").err().expect("stay_id is not a reference");
+        assert!(e.to_string().contains("via stay_id: stay_id is not a reference of stays that leads to beds"), "{e}");
+        let e = plan("relations: [{ from: stays.bed_id, to: beds.bed_id, via: nope }]\n").err().expect("no such column");
+        assert!(e.to_string().contains("stays has no column nope"), "{e}");
+    }
+
+    #[test]
+    fn the_model_version_changes_the_fingerprint() {
+        let (schema, plan) = plan("").unwrap();
+        let (_, independent) = self::plan("relations: [{ from: locations.room_id, to: rooms.room_id, via: none }]\n").unwrap();
+        assert_ne!(plan.fingerprint(&schema), independent.fingerprint(&schema), "following a chain changes the data, so the fingerprint");
     }
 }

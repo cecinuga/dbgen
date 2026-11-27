@@ -11,6 +11,7 @@
 //! | `resume_reloads_tables_that_lost_rows` | yes | exact counts drive resume: lost rows come back, identical |
 //! | `batches_are_atomic` | yes | a batch that fails leaves no row behind, and its error is not transient |
 //! | `missing_database_is_reported` | yes | a missing database is `UnknownDatabase`, which `--create-database` fixes |
+//! | `generate_creates_the_schema_in_an_empty_database` | yes | `generate` runs the DDL in a database with none of its tables (not in a dry run, not twice), and refuses one with part of them |
 //! | `every_domain_end_to_end` | yes | every `tests/fixtures/<domain>/<connector>.sql` applies, loads and verifies |
 //! | `introspection_round_trip` | yes | every fixture, applied, reads back through `introspect_ddl` as the same schema, which plans the same rows |
 //!
@@ -121,6 +122,12 @@ macro_rules! conformance_tests {
         fn missing_database_is_reported() {
             let Some(s) = $server() else { return };
             $crate::common::missing_database(&s, concat!("dbgen_it_", $prefix, "_missing_test"));
+        }
+
+        #[test]
+        fn generate_creates_the_schema_in_an_empty_database() {
+            let Some(s) = $server() else { return };
+            $crate::common::empty_database(&s, concat!("dbgen_it_", $prefix, "_empty_test"));
         }
 
         #[test]
@@ -343,6 +350,40 @@ pub fn missing_database(server: &Server, name: &str) {
     let config = Config::parse(&format!("database: \"{}\"", (server.url)(name)), Path::new("dbgen.yaml")).unwrap();
     let e = Database::connect(&config).unwrap().version().expect_err("the database does not exist");
     assert_eq!(e.kind, DbErrorKind::UnknownDatabase, "{e}");
+}
+
+/// In a database that has none of the schema's tables, a dry run writes nothing, and
+/// `generate` runs the DDL (its INSERTs included) before loading. The next run does not
+/// run it again, which would fail on `CREATE TABLE`; a database with part of the schema
+/// is refused.
+pub fn empty_database(server: &Server, name: &str) {
+    assert!(name.ends_with("_test"), "tests only touch *_test databases");
+    (server.drop)(name);
+    let config = test_dir(name).join("dbgen.yaml");
+    let yaml = format!("database: \"{}\"\nschema: \"{}\"\n{SMALL_SHOP}", (server.url)(name), shop_fixture(server.connector).display());
+    std::fs::write(&config, yaml).unwrap();
+    let db = connect(&config);
+    db.create_database().unwrap();
+    let options = |dry_run| GenerateOptions { config_path: config.clone(), reset: false, dry_run, report: None, progress_bars: false, verify: true };
+    let has_tables = || {
+        let live = db.live_columns().unwrap();
+        TABLES.iter().any(|t| live.contains_key(*t))
+    };
+
+    run::generate(options(true)).unwrap_or_else(|e| panic!("dry run: {e}"));
+    assert!(!has_tables(), "a dry run created tables");
+
+    let outcome = generate(&config, false);
+    assert_success(&outcome);
+    assert_eq!(outcome.summary.unwrap().tables.iter().map(|t| t.final_rows.unwrap()).sum::<u64>(), 10 + 50 + 20 + 100 + 200);
+    assert!(db.count("countries").unwrap() > 0, "the INSERTs of the DDL did not run");
+
+    assert_success(&generate(&config, false));
+
+    db.execute("DROP TABLE order_lines").unwrap();
+    let e = run::generate(options(false)).err().expect("a database with part of the schema must be refused");
+    assert!(e.to_string().contains("only part of the schema"), "{e}");
+    (server.drop)(name);
 }
 
 /// Every domain fixture of the connector applies, loads every table to its target, and

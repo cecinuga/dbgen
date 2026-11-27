@@ -5,7 +5,7 @@
 #   bin/dbgen validate -c examples/agevola/reporting-test.yaml
 #   bin/dbgen generate -c examples/agevola/reporting-test.yaml --verify
 database: "http://clickhouse:${CH_PASSWORD}@localhost:8125/reporting_dwh_db"
-schema: ../../../reporting-etl-service/sql/migrations
+schema: /home/m-marchetti/Desktop/Progetti/Agevola/Repo/reporting-system/reporting-etl-service/sql/migrations
 
 generation:
   seed: 42
@@ -14,38 +14,39 @@ generation:
   history_days: 365
 
 tables:
-  dim_floor: 4
+  dim_floor: 6
   dim_room_type: 2
-  dim_room: 40
+  dim_room: 10
   dim_bed_type: 2
-  dim_bed: 60
+  dim_bed: 20
   dim_alarm_types: 5
   dim_device: 60
-  dim_team: 10
+  dim_team: 15
   dim_posture_protocol: 3
   dim_patient: 60
   dim_staff: 212
   dim_location: 60
   dim_room_version: 40
   dim_floor_version: 4
-  fact_patient_occupancy: 50000
-  fact_device_assignment: 50000
-  fact_staff_team_membership: 50000
-  fact_staff_responsibility: 50000
-  fact_alarms: 50000
-  fact_device_vitals_compact: 50000
-  fact_bed_status: 50000
-  fact_room_status: 50000
-  fact_floor_status: 50000
-  fact_blackouts: 50000
-  fact_posture_assignments: 50000
-  fact_posture_movements: 50000
-  fact_media_records: 50000
-  fact_staff_activity: 50000
-  fact_device_bed_state_changes: 50000
-  fact_vitals_daily: 365
+  fact_patient_occupancy: 5000000
+  fact_device_assignment: 5000000
+  fact_staff_team_membership: 5000000
+  fact_staff_responsibility: 5000000
+  fact_alarms: 5000000
+  fact_device_vitals_compact: 800000
+  fact_bed_status: 900000
+  fact_room_status: 750000
+  fact_floor_status: 600000
+  fact_blackouts: 4510000
+  fact_posture_assignments: 5000000
+  fact_posture_movements: 5000000
+  fact_media_records: 8000000
+  fact_staff_activity: 900000
+  fact_device_bed_state_changes: 120000
+  fact_vitals_daily: 3650000
   etl_load_checkpoint: skip
   etl_dead_letter: skip
+  translation: skip
 
 # References the column names do not reveal (inferred ones are listed by `dbgen inspect`).
 relations:

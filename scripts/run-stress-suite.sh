@@ -11,7 +11,7 @@
 #   BIN=bin/dbgen        the dbgen binary (scripts/cargo-docker.sh build --release)
 #   REPORTS=reports      where reports and logs go
 #
-# Every generated table of every target database is emptied first (--reset). A failed
+# Every generated table of every target database is emptied first (--fresh). A failed
 # configuration stops the series; the exit code is dbgen's.
 set -uo pipefail
 
@@ -45,7 +45,7 @@ for config in "${CONFIGS[@]}"; do
   echo "=== $name: applying the DDL (log: $log)"
   "$BIN" apply -c "$config" --create-database >"$log" 2>&1 || { tail -5 "$log" >&2; exit 1; }
   echo "=== $name: loading"
-  "$BIN" generate -c "$config" --reset --no-progress "${VERIFY[@]}" --report "$REPORTS/$name.json" >>"$log" 2>&1
+  "$BIN" generate -c "$config" --fresh --no-progress "${VERIFY[@]}" --report "$REPORTS/$name.json" >>"$log" 2>&1
   code=$?
   sed -n '/^Total Target Rows/,/^Overall Status/p' "$log"
   grep -E '^Passed: ' "$log"

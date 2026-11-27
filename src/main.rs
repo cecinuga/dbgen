@@ -134,6 +134,10 @@ enum Command {
         /// Print the schema as JSON.
         #[arg(long)]
         json: bool,
+        /// Also write the schema's DDL to FILE as one SQL script, replacing it if it exists.
+        /// Read from the database, this dumps the schema of a live database.
+        #[arg(short, long, value_name = "FILE")]
+        out: Option<PathBuf>,
         /// DDL files or directories (same as --schema).
         files: Vec<PathBuf>,
     },
@@ -167,7 +171,8 @@ enum Command {
         #[arg(long)]
         create_database: bool,
     },
-    /// Generate and load the rows (resumes an interrupted run automatically).
+    /// Generate and load the rows (resumes an interrupted run automatically). In a database
+    /// with none of the tables of the DDL files, runs the DDL first.
     Generate {
         #[command(flatten)]
         target: Target,
@@ -177,7 +182,7 @@ enum Command {
         load: Load,
         /// Empty every generated table first.
         #[arg(long, help_heading = "Run")]
-        reset: bool,
+        fresh: bool,
         /// Validate and print the plan, then stop.
         #[arg(long, help_heading = "Run")]
         dry_run: bool,
@@ -234,9 +239,9 @@ fn resolve(target: Target, data: Option<Data>, load: Option<Load>) -> Result<Con
 
 fn run(command: Command) -> Result<i32> {
     match command {
-        Command::Inspect { mut target, data, json, files } => {
+        Command::Inspect { mut target, data, json, out, files } => {
             target.schema.extend(files);
-            run::inspect(&resolve(target, Some(data), None)?, json)?;
+            run::inspect(&resolve(target, Some(data), None)?, json, out.as_deref())?;
         }
         Command::Init { target, rows, output, force } => {
             let text = run::init(&resolve(target, None, None)?, rows)?;
@@ -253,9 +258,9 @@ fn run(command: Command) -> Result<i32> {
         }
         Command::Validate { target, data } => run::validate(resolve(target, Some(data), None)?)?,
         Command::Apply { target, create_database } => run::apply_config(&resolve(target, None, None)?, create_database)?,
-        Command::Generate { target, data, load, reset, dry_run, verify, report, no_progress } => {
+        Command::Generate { target, data, load, fresh, dry_run, verify, report, no_progress } => {
             let config = resolve(target, Some(data), Some(load))?;
-            let opts = GenerateOptions { config_path: config.path.clone(), reset, dry_run, report, progress_bars: !no_progress, verify };
+            let opts = GenerateOptions { config_path: config.path.clone(), reset: fresh, dry_run, report, progress_bars: !no_progress, verify };
             let outcome = run::generate_config(config, &opts)?;
             if let Some(summary) = &outcome.summary {
                 println!("{}", summary.render());
