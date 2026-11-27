@@ -294,7 +294,10 @@ impl Load<'_> {
             let cells = RowRef { types: &types, values: &row.values, columns: &tg.insert };
             self.db.encode_row(&mut batch.body, &cells).map_err(|e| {
                 let col = &tg.cols[tg.insert[e.column]];
-                Error::Generation(format!("table {}, row {i}, column {}: {} (value {})", tg.name, col.name, e.message, row.values[tg.insert[e.column]]))
+                Error::Generation(format!(
+                    "table {}, row {i}, column {}: {} (value {})",
+                    tg.name, col.name, e.message, row.values[tg.insert[e.column]]
+                ))
             })?;
             batch.row_ends.push(batch.body.len());
         }

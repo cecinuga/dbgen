@@ -6,11 +6,11 @@
 //! only it knows.
 
 use sqlparser::ast::{
-    ArrayElemTypeDef, ColumnDef, ColumnOption, DataType as S, EnumMember, ExactNumberInfo, Expr, TableConstraint,
-    TypeModifier, UnaryOperator, Value as SqlValue,
+    ArrayElemTypeDef, ColumnDef, ColumnOption, DataType as S, EnumMember, ExactNumberInfo, Expr, TableConstraint, TypeModifier, UnaryOperator,
+    Value as SqlValue,
 };
 
-use super::{unqualified, CheckSpec, ColumnSpec, DefaultKind, DefaultSpec, ExprSpec, ForeignKeySpec, Statement, UniqueSpec};
+use super::{CheckSpec, ColumnSpec, DefaultKind, DefaultSpec, ExprSpec, ForeignKeySpec, Statement, UniqueSpec, unqualified};
 use crate::schema::DataType;
 
 /// How a dialect reads type spellings and column definitions.
@@ -62,9 +62,8 @@ pub fn no_custom_type(_name: &str, _modifiers: &[TypeModifier], _rules: &TypeRul
 /// Converts a parsed SQL type.
 pub fn data_type(t: &S, rules: &TypeRules) -> DataType {
     let int = |bits: u16, signed: bool| DataType::Int { bits, signed };
-    let string = |len: Option<u64>| DataType::String {
-        max_len: if rules.varchar_has_length { len.map(|l| l.min(u32::MAX as u64) as u32) } else { None },
-    };
+    let string =
+        |len: Option<u64>| DataType::String { max_len: if rules.varchar_has_length { len.map(|l| l.min(u32::MAX as u64) as u32) } else { None } };
     match t {
         S::Nullable(inner) => DataType::Nullable(Box::new(data_type(inner, rules))),
         S::LowCardinality(inner) => DataType::LowCardinality(Box::new(data_type(inner, rules))),
@@ -91,7 +90,12 @@ pub fn data_type(t: &S, rules: &TypeRules) -> DataType {
             ExactNumberInfo::Precision(p) | ExactNumberInfo::PrecisionAndScale(p, _) if *p > 24 => DataType::Float { bits: 64 },
             _ => DataType::Float { bits: 32 },
         },
-        S::Decimal(info) | S::DecimalUnsigned(info) | S::Numeric(info) | S::Dec(info) | S::DecUnsigned(info) | S::BigNumeric(info)
+        S::Decimal(info)
+        | S::DecimalUnsigned(info)
+        | S::Numeric(info)
+        | S::Dec(info)
+        | S::DecUnsigned(info)
+        | S::BigNumeric(info)
         | S::BigDecimal(info) => match info {
             ExactNumberInfo::None => DataType::Decimal { precision: 10, scale: 0 },
             ExactNumberInfo::Precision(p) => DataType::Decimal { precision: (*p).min(76) as u8, scale: 0 },
@@ -107,9 +111,7 @@ pub fn data_type(t: &S, rules: &TypeRules) -> DataType {
                 sqlparser::ast::CharacterLength::Max => None,
             }))
         }
-        S::Blob(_) | S::TinyBlob | S::MediumBlob | S::LongBlob | S::Bytea | S::Bytes(_) | S::Varbinary(_) => {
-            DataType::String { max_len: None }
-        }
+        S::Blob(_) | S::TinyBlob | S::MediumBlob | S::LongBlob | S::Bytea | S::Bytes(_) | S::Varbinary(_) => DataType::String { max_len: None },
         S::Binary(Some(n)) => DataType::FixedString(*n as u32),
         S::Binary(None) => DataType::String { max_len: None },
         S::FixedString(n) => DataType::FixedString(*n as u32),
@@ -135,10 +137,12 @@ pub fn data_type(t: &S, rules: &TypeRules) -> DataType {
             ArrayElemTypeDef::None => DataType::Unsupported(t.to_string()),
         },
         S::Map(k, v, _) => DataType::Map(Box::new(data_type(k, rules)), Box::new(data_type(v, rules))),
-        S::Tuple(fields) => DataType::Tuple(fields.iter().map(|f| (f.field_name.as_ref().map(|n| n.value.clone()), data_type(&f.field_type, rules))).collect()),
-        S::Nested(cols) => DataType::Array(Box::new(DataType::Tuple(
-            cols.iter().map(|c| (Some(c.name.value.clone()), data_type(&c.data_type, rules))).collect(),
-        ))),
+        S::Tuple(fields) => {
+            DataType::Tuple(fields.iter().map(|f| (f.field_name.as_ref().map(|n| n.value.clone()), data_type(&f.field_type, rules))).collect())
+        }
+        S::Nested(cols) => {
+            DataType::Array(Box::new(DataType::Tuple(cols.iter().map(|c| (Some(c.name.value.clone()), data_type(&c.data_type, rules))).collect())))
+        }
         S::Custom(name, mods) => (rules.custom_type)(&unqualified(name), mods, rules).unwrap_or_else(|| DataType::Unsupported(t.to_string())),
         other => DataType::Unsupported(other.to_string()),
     }
@@ -281,13 +285,9 @@ pub fn column(stmt: &Statement, def: ColumnDef, rules: &TypeRules) -> Vec<Column
             ColumnOption::Null => nullable = Some(true),
             ColumnOption::NotNull => nullable = Some(false),
             ColumnOption::Default(e) => spec.default = Some(DefaultSpec { kind: DefaultKind::Default, expr: Some(expr_spec(stmt, e)) }),
-            ColumnOption::Materialized(e) => {
-                spec.default = Some(DefaultSpec { kind: DefaultKind::Materialized, expr: Some(expr_spec(stmt, e)) })
-            }
+            ColumnOption::Materialized(e) => spec.default = Some(DefaultSpec { kind: DefaultKind::Materialized, expr: Some(expr_spec(stmt, e)) }),
             ColumnOption::Alias(e) => spec.default = Some(DefaultSpec { kind: DefaultKind::Alias, expr: Some(expr_spec(stmt, e)) }),
-            ColumnOption::Ephemeral(e) => {
-                spec.default = Some(DefaultSpec { kind: DefaultKind::Ephemeral, expr: e.map(|e| expr_spec(stmt, e)) })
-            }
+            ColumnOption::Ephemeral(e) => spec.default = Some(DefaultSpec { kind: DefaultKind::Ephemeral, expr: e.map(|e| expr_spec(stmt, e)) }),
             ColumnOption::Generated { generation_expr: Some(e), .. } => {
                 spec.default = Some(DefaultSpec { kind: DefaultKind::Materialized, expr: Some(expr_spec(stmt, e)) })
             }
@@ -295,7 +295,8 @@ pub fn column(stmt: &Statement, def: ColumnDef, rules: &TypeRules) -> Vec<Column
                 spec.default = Some(DefaultSpec { kind: DefaultKind::Identity, expr: None })
             }
             ColumnOption::DialectSpecific(tokens) => {
-                if tokens.iter().any(|t| t.to_string().eq_ignore_ascii_case("AUTO_INCREMENT") || t.to_string().eq_ignore_ascii_case("AUTOINCREMENT")) {
+                if tokens.iter().any(|t| t.to_string().eq_ignore_ascii_case("AUTO_INCREMENT") || t.to_string().eq_ignore_ascii_case("AUTOINCREMENT"))
+                {
                     spec.default = Some(DefaultSpec { kind: DefaultKind::Identity, expr: None });
                 }
             }

@@ -112,10 +112,8 @@ impl<'s> Statement<'s> {
 /// Tokenizes `source` with `dialect` and splits it into statements at top-level `;`.
 /// The `;` inside the `BEGIN ... END` body of a `CREATE TRIGGER` do not split.
 pub fn split<'s>(source: &'s Source, dialect: &dyn SqlDialect) -> Result<Vec<Statement<'s>>, Diag> {
-    let tokens = Tokenizer::new(dialect, &source.text).tokenize_with_location().map_err(|e| Diag {
-        at: source.at(e.location),
-        message: e.message.clone(),
-    })?;
+    let tokens =
+        Tokenizer::new(dialect, &source.text).tokenize_with_location().map_err(|e| Diag { at: source.at(e.location), message: e.message.clone() })?;
     let mut out = Vec::new();
     let mut current: Vec<TokenWithSpan> = Vec::new();
     let mut depth = 0i32;
@@ -346,21 +344,42 @@ pub enum Ddl {
     CreateTable(TableDef),
     /// `CREATE TABLE name AS source ...` or `... LIKE source`: the structure of `source`,
     /// with `def`'s clauses.
-    CreateTableLike { def: TableDef, source: String },
-    AlterTable { table: String, actions: Vec<AlterAction> },
-    DropTables { names: Vec<String>, if_exists: bool },
+    CreateTableLike {
+        def: TableDef,
+        source: String,
+    },
+    AlterTable {
+        table: String,
+        actions: Vec<AlterAction>,
+    },
+    DropTables {
+        names: Vec<String>,
+        if_exists: bool,
+    },
     RenameTables(Vec<(String, String)>),
     ExchangeTables(String, String),
     /// A named type usable in later column definitions: a PostgreSQL enum or domain.
-    CreateType { name: String, ty: DataType },
+    CreateType {
+        name: String,
+        ty: DataType,
+    },
     /// `CREATE UNIQUE INDEX`: a uniqueness constraint under another name.
-    CreateUniqueIndex { table: String, name: Option<String>, columns: Vec<String> },
+    CreateUniqueIndex {
+        table: String,
+        name: Option<String>,
+        columns: Vec<String>,
+    },
     /// `DROP INDEX`: removes the unique keys created under these names, if any.
     DropIndexes(Vec<String>),
     /// Data written by the DDL input itself (seed rows).
-    Insert { table: String },
+    Insert {
+        table: String,
+    },
     /// A view that writes into `target` whenever its source table receives rows.
-    MaterializedView { name: String, target: Option<String> },
+    MaterializedView {
+        name: String,
+        target: Option<String>,
+    },
     /// Anything that does not change table structure, by leading keywords.
     Ignored(String),
 }
@@ -492,26 +511,61 @@ pub struct EngineSpec {
 /// One change of an `ALTER TABLE` statement.
 #[derive(Debug, Clone)]
 pub enum AlterAction {
-    AddColumn { column: ColumnSpec, if_not_exists: bool, after: Option<ColumnPosition> },
-    DropColumn { name: String, if_exists: bool },
+    AddColumn {
+        column: ColumnSpec,
+        if_not_exists: bool,
+        after: Option<ColumnPosition>,
+    },
+    DropColumn {
+        name: String,
+        if_exists: bool,
+    },
     /// Changes what is given, keeps the rest. `ty` None: the type is unchanged.
-    ModifyColumn { name: String, if_exists: bool, ty: Option<DataType>, default: Option<DefaultSpec>, comment: Option<String> },
+    ModifyColumn {
+        name: String,
+        if_exists: bool,
+        ty: Option<DataType>,
+        default: Option<DefaultSpec>,
+        comment: Option<String>,
+    },
     /// Replaces the whole definition of column `name` (MySQL `MODIFY`/`CHANGE COLUMN`).
-    ReplaceColumn { name: String, column: ColumnSpec },
+    ReplaceColumn {
+        name: String,
+        column: ColumnSpec,
+    },
     /// Changes the type and keeps the column's nullability (`ALTER COLUMN ... TYPE`).
-    SetType { name: String, ty: DataType },
+    SetType {
+        name: String,
+        ty: DataType,
+    },
     /// `SET NOT NULL` (false) or `DROP NOT NULL` (true).
-    SetNullable { name: String, nullable: bool },
+    SetNullable {
+        name: String,
+        nullable: bool,
+    },
     /// `REMOVE DEFAULT|MATERIALIZED|ALIAS|COMMENT...`: drops that property.
-    RemoveColumnProperty { name: String, property: String },
-    RenameColumn { from: String, to: String, if_exists: bool },
-    CommentColumn { name: String, comment: String },
+    RemoveColumnProperty {
+        name: String,
+        property: String,
+    },
+    RenameColumn {
+        from: String,
+        to: String,
+        if_exists: bool,
+    },
+    CommentColumn {
+        name: String,
+        comment: String,
+    },
     AddCheck(CheckSpec),
     AddPrimaryKey(Vec<String>),
     AddUnique(UniqueSpec),
     AddForeignKey(ForeignKeySpec),
     /// Drops the check, key or foreign key of that name.
-    DropConstraint { name: String, if_exists: bool },
+    DropConstraint {
+        name: String,
+        if_exists: bool,
+    },
     DropPrimaryKey,
     ModifyOrderBy(Vec<ExprSpec>),
     ModifyComment(String),

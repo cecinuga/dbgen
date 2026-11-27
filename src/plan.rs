@@ -6,16 +6,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
-use crate::config::{yaml_str, ColumnConfig, Config, Distribution, MissingTables, TableTarget};
+use crate::config::{ColumnConfig, Config, Distribution, MissingTables, TableTarget, yaml_str};
 use crate::error::{Error, Result};
-use crate::expr::{cast, CExpr, Compiler, EvalCtx};
-use crate::generator::domain::{self, default_domain, domain_nth, domain_size, Domain, TextKind, Unique};
+use crate::expr::{CExpr, Compiler, EvalCtx, cast};
+use crate::generator::domain::{self, Domain, TextKind, Unique, default_domain, domain_nth, domain_size};
 use crate::generator::perm::Perm;
 use crate::generator::{CheckGen, ColGen, Component, ExistingRows, Mutability, Pick, ProductGen, RelGen, Row, Strategy, TableGen, World};
 use crate::rng::{hash, tag};
 use crate::schema::{DataType, KeyPart, Schema, Table};
 use crate::sql::DefaultKind;
-use crate::timeutil::{parse_duration, parse_instant, today_utc_midnight, Rfc3339, US_PER_DAY, US_PER_HOUR, US_PER_MIN, US_PER_SEC};
+use crate::timeutil::{Rfc3339, US_PER_DAY, US_PER_HOUR, US_PER_MIN, US_PER_SEC, parse_duration, parse_instant, today_utc_midnight};
 use crate::value::Value;
 
 /// Bump when a change makes the same seed and configuration produce different data, so
@@ -168,7 +168,9 @@ fn time_window(g: &crate::config::Generation) -> Result<(i64, i64)> {
 fn table_modes(config: &Config, schema: &Schema, found: &mut Findings) -> Vec<TablePlan> {
     for name in config.tables.keys() {
         if schema.table(name).is_none() {
-            found.problems.push(format!("tables.{name}: no such table in the schema{}", suggest(name, schema.tables.iter().map(|t| t.name.as_str()))));
+            found
+                .problems
+                .push(format!("tables.{name}: no such table in the schema{}", suggest(name, schema.tables.iter().map(|t| t.name.as_str()))));
         }
     }
     let mut missing = Vec::new();
@@ -187,7 +189,9 @@ fn table_modes(config: &Config, schema: &Schema, found: &mut Findings) -> Vec<Ta
             }
             Some(TableTarget::Existing) => (Mode::Existing, None),
             None if t.seeded => (Mode::Existing, Some("seeded by the DDL input".to_string())),
-            None if t.derived_by.is_some() => (Mode::Existing, Some(format!("written by materialized view {}", t.derived_by.as_deref().unwrap_or("")))),
+            None if t.derived_by.is_some() => {
+                (Mode::Existing, Some(format!("written by materialized view {}", t.derived_by.as_deref().unwrap_or(""))))
+            }
             None if !t.storage => (Mode::Skip, Some("does not store rows".to_string())),
             None => match config.generation.default_rows {
                 Some(0) => (Mode::Skip, Some("default_rows is 0".to_string())),
@@ -251,7 +255,10 @@ fn find_relations(config: &Config, schema: &Schema, generated: &[bool], found: &
                 match parent.primary_key() {
                     Some(pk) => pk.iter().map(|s| s.to_string()).collect(),
                     None => {
-                        problems.push(format!("table {}: foreign key to {} names no columns and {} has no primary key", t.name, parent.name, parent.name));
+                        problems.push(format!(
+                            "table {}: foreign key to {} names no columns and {} has no primary key",
+                            t.name, parent.name, parent.name
+                        ));
                         continue;
                     }
                 }
@@ -259,7 +266,9 @@ fn find_relations(config: &Config, schema: &Schema, generated: &[bool], found: &
                 fk.ref_columns.clone()
             };
             let ctx = format!("table {} foreign key", t.name);
-            let (Some(child_cols), Some(parent_cols)) = (resolve_cols(t, &fk.columns, problems, &ctx), resolve_cols(parent, &ref_cols, problems, &ctx)) else {
+            let (Some(child_cols), Some(parent_cols)) =
+                (resolve_cols(t, &fk.columns, problems, &ctx), resolve_cols(parent, &ref_cols, problems, &ctx))
+            else {
                 continue;
             };
             if child_cols.iter().any(|&c| covered.contains(&(ci, c)) || is_ignored(c)) {
@@ -287,7 +296,13 @@ struct InferredRef {
 /// parent in the same role (`patient_key` and `patient_id`, but not
 /// `acknowledger_staff_key` and `resolver_staff_key`) form one reference, so they point
 /// at the same parent row.
-fn infer_relations(config: &Config, schema: &Schema, ci: usize, covered: &mut HashSet<(usize, usize)>, is_ignored: &dyn Fn(usize) -> bool) -> Vec<RelDraft> {
+fn infer_relations(
+    config: &Config,
+    schema: &Schema,
+    ci: usize,
+    covered: &mut HashSet<(usize, usize)>,
+    is_ignored: &dyn Fn(usize) -> bool,
+) -> Vec<RelDraft> {
     let t = &schema.tables[ci];
     let mut refs: Vec<InferredRef> = Vec::new();
     for (c, col) in t.columns.iter().enumerate() {
@@ -357,15 +372,7 @@ fn relation_gen(d: &RelDraft, schema: &Schema, parent_rows: u64) -> RelGen {
         Distribution::Uniform => Pick::Uniform,
         Distribution::Skewed => Pick::Skewed { skew: d.skew, perm: Perm::new(parent_rows.max(1), rel_tag) },
     };
-    RelGen {
-        child: d.child,
-        parent: d.parent,
-        child_cols: d.child_cols.clone(),
-        parent_cols: d.parent_cols.clone(),
-        parent_rows,
-        pick,
-        tag: rel_tag,
-    }
+    RelGen { child: d.child, parent: d.parent, child_cols: d.child_cols.clone(), parent_cols: d.parent_cols.clone(), parent_rows, pick, tag: rel_tag }
 }
 
 /// A unique parent key makes references unambiguous: referenced single columns that the
@@ -402,7 +409,12 @@ fn resolve_references_to_empty_tables(world: &mut World, schema: &Schema, tables
                 tg.cols[c].describe = format!("NULL ({} {what})", parent.name);
             }
             if have_rows {
-                found.warnings.push(format!("{}.{} references {}, which {what}: the column is left NULL", child.name, names(child, &rel.child_cols), parent.name));
+                found.warnings.push(format!(
+                    "{}.{} references {}, which {what}: the column is left NULL",
+                    child.name,
+                    names(child, &rel.child_cols),
+                    parent.name
+                ));
             }
         } else if have_rows {
             found.problems.push(format!(
@@ -437,11 +449,7 @@ fn check_reference_ranges(world: &World, problems: &mut Vec<String>) {
 
 fn names(t: &Table, cols: &[usize]) -> String {
     let n: Vec<&str> = cols.iter().map(|&c| t.columns[c].name.as_str()).collect();
-    if n.len() == 1 {
-        n[0].to_string()
-    } else {
-        format!("({})", n.join(", "))
-    }
+    if n.len() == 1 { n[0].to_string() } else { format!("({})", n.join(", ")) }
 }
 
 fn resolve_cols(t: &Table, cols: &[String], problems: &mut Vec<String>, ctx: &str) -> Option<Vec<usize>> {
@@ -496,9 +504,11 @@ fn infer_relation(schema: &Schema, ci: usize, c: usize) -> Option<(usize, usize,
             .tables
             .iter()
             .enumerate()
-            .filter(|(pi, p)| *pi != ci && p.storage && {
-                let n = domain::strip_table_prefix(&p.name.to_ascii_lowercase());
-                n == cand || domain::singular(&n) == cand
+            .filter(|(pi, p)| {
+                *pi != ci && p.storage && {
+                    let n = domain::strip_table_prefix(&p.name.to_ascii_lowercase());
+                    n == cand || domain::singular(&n) == cand
+                }
             })
             .map(|(pi, _)| pi)
             .collect();
@@ -510,11 +520,7 @@ fn infer_relation(schema: &Schema, ci: usize, c: usize) -> Option<(usize, usize,
         let wanted = [format!("{cand}_{suffix}"), name.clone(), suffix.to_string()];
         let pc = wanted.iter().find_map(|w| parent.columns.iter().position(|pcol| pcol.name.eq_ignore_ascii_case(w))).or_else(|| {
             let pk = parent.primary_key()?;
-            if pk.len() == 1 {
-                parent.column_index(pk[0])
-            } else {
-                None
-            }
+            if pk.len() == 1 { parent.column_index(pk[0]) } else { None }
         })?;
         if compatible(&col.ty, &parent.columns[pc].ty) {
             return Some((pi, pc, tokens[..k].join("_")));
@@ -603,15 +609,7 @@ fn configured_domain(cfg: &ColumnConfig, ty: &DataType, window: (i64, i64)) -> s
     Ok(None)
 }
 
-fn build_table(
-    config: &Config,
-    schema: &Schema,
-    ti: usize,
-    rows: u64,
-    window: (i64, i64),
-    world: &mut World,
-    found: &mut Findings,
-) -> TableGen {
+fn build_table(config: &Config, schema: &Schema, ti: usize, rows: u64, window: (i64, i64), world: &mut World, found: &mut Findings) -> TableGen {
     let g = &config.generation;
     let t = &schema.tables[ti];
     let table_tag = tag(&t.name);
@@ -623,7 +621,9 @@ fn build_table(
     for ch in &t.checks {
         match compiler.compile(&ch.expr) {
             Ok(e) => checks.push((ch.name.clone(), ch.sql.clone(), e)),
-            Err(m) => found.warnings.push(format!("table {}: CHECK {} is not evaluated by dbgen ({m}); the database may reject rows", t.name, ch.name)),
+            Err(m) => {
+                found.warnings.push(format!("table {}: CHECK {} is not evaluated by dbgen ({m}); the database may reject rows", t.name, ch.name))
+            }
         }
     }
     let mut check_cols = BTreeSet::new();
@@ -732,9 +732,15 @@ fn build_table(
     // Unknown columns in the configuration.
     for key in config.columns.keys() {
         if let Some((tn, cn)) = key.rsplit_once('.')
-            && tn == t.name && t.column(cn).is_none() {
-                found.problems.push(format!("columns.{key}: table {} has no column {cn}{}", t.name, suggest(cn, t.columns.iter().map(|c| c.name.as_str()))));
-            }
+            && tn == t.name
+            && t.column(cn).is_none()
+        {
+            found.problems.push(format!(
+                "columns.{key}: table {} has no column {cn}{}",
+                t.name,
+                suggest(cn, t.columns.iter().map(|c| c.name.as_str()))
+            ));
+        }
     }
 
     // What the checks say about single columns.
@@ -750,12 +756,13 @@ fn build_table(
         for conj in e.conjuncts() {
             if let Some((c, vals)) = conj.closed_domain()
                 && let Strategy::Random(_) = cols[c].strategy
-                    && !configured[c] {
-                        let vals: Vec<Value> = vals.into_iter().map(|v| cast(v, &cols[c].ty)).filter(|v| !v.is_null()).collect();
-                        if !vals.is_empty() {
-                            cols[c].strategy = Strategy::Random(Domain::values(vals, None));
-                        }
-                    }
+                && !configured[c]
+            {
+                let vals: Vec<Value> = vals.into_iter().map(|v| cast(v, &cols[c].ty)).filter(|v| !v.is_null()).collect();
+                if !vals.is_empty() {
+                    cols[c].strategy = Strategy::Random(Domain::values(vals, None));
+                }
+            }
             for (c, op, v) in conj.bounds() {
                 let col = &mut cols[c];
                 if let Strategy::Random(d) = &mut col.strategy {
@@ -935,10 +942,15 @@ fn build_table(
     for c in 0..cols.len() {
         let n = cols[c].name.to_ascii_lowercase();
         let id_like = n == "id" || n.ends_with("_id") || n.ends_with("_key") || n.ends_with("_uuid");
-        if id_like && !configured[c] && !cols[c].nullable && matches!(cols[c].strategy, Strategy::Random(Domain::Int { .. } | Domain::Uuid)) && !check_cols.contains(&c)
-            && let Some(u) = make_unique(&cols[c], rows, g.seed, table_tag, window) {
-                cols[c].strategy = Strategy::Unique(u);
-            }
+        if id_like
+            && !configured[c]
+            && !cols[c].nullable
+            && matches!(cols[c].strategy, Strategy::Random(Domain::Int { .. } | Domain::Uuid))
+            && !check_cols.contains(&c)
+            && let Some(u) = make_unique(&cols[c], rows, g.seed, table_tag, window)
+        {
+            cols[c].strategy = Strategy::Unique(u);
+        }
         if config.column(&t.name, &cols[c].name).and_then(|cc| cc.unique) == Some(true) && !matches!(cols[c].strategy, Strategy::Unique(_)) {
             match make_unique(&cols[c], rows, g.seed, table_tag, window) {
                 Some(u) => cols[c].strategy = Strategy::Unique(u),
@@ -948,26 +960,27 @@ fn build_table(
     }
     // The partitioning column follows row order, so a batch touches few partitions.
     if let Some(p) = &t.partition_by
-        && let Ok(e) = compiler.compile(&p.expr) {
-            let mut used = BTreeSet::new();
-            e.columns(&mut used);
-            if used.len() == 1 {
-                let c = *used.iter().next().unwrap();
-                if !configured[c] {
-                    if let Strategy::Random(Domain::Time { lo, hi, precision }) = cols[c].strategy {
-                        cols[c].strategy = Strategy::Random(Domain::Ordered { lo, hi: hi + 1, rows, precision, date: false });
-                    } else if let Strategy::Random(Domain::Date { lo, hi }) = cols[c].strategy {
-                        cols[c].strategy = Strategy::Random(Domain::Ordered {
-                            lo: lo as i64 * US_PER_DAY,
-                            hi: (hi as i64 + 1) * US_PER_DAY,
-                            rows,
-                            precision: None,
-                            date: true,
-                        });
-                    }
+        && let Ok(e) = compiler.compile(&p.expr)
+    {
+        let mut used = BTreeSet::new();
+        e.columns(&mut used);
+        if used.len() == 1 {
+            let c = *used.iter().next().unwrap();
+            if !configured[c] {
+                if let Strategy::Random(Domain::Time { lo, hi, precision }) = cols[c].strategy {
+                    cols[c].strategy = Strategy::Random(Domain::Ordered { lo, hi: hi + 1, rows, precision, date: false });
+                } else if let Strategy::Random(Domain::Date { lo, hi }) = cols[c].strategy {
+                    cols[c].strategy = Strategy::Random(Domain::Ordered {
+                        lo: lo as i64 * US_PER_DAY,
+                        hi: (hi as i64 + 1) * US_PER_DAY,
+                        rows,
+                        precision: None,
+                        date: true,
+                    });
                 }
             }
         }
+    }
 
     // Mutability, purity, repairable columns, evaluation order.
     for (c, col) in cols.iter_mut().enumerate() {
@@ -976,8 +989,7 @@ fn build_table(
             Strategy::Ref { .. } if col.nullable => Mutability::NullOnly,
             _ => Mutability::Fixed,
         };
-        col.pure = !check_cols.contains(&c)
-            && !matches!(col.strategy, Strategy::After { .. } | Strategy::Derived(_) | Strategy::Computed(_));
+        col.pure = !check_cols.contains(&c) && !matches!(col.strategy, Strategy::After { .. } | Strategy::Derived(_) | Strategy::Computed(_));
         col.describe = describe(col, world, schema, ti);
     }
     let check_gens: Vec<CheckGen> = checks
@@ -1034,9 +1046,10 @@ fn depends_on(deps: &HashMap<usize, Vec<usize>>, from: usize, target: usize) -> 
             return true;
         }
         if seen.insert(c)
-            && let Some(d) = deps.get(&c) {
-                stack.extend(d.iter().copied());
-            }
+            && let Some(d) = deps.get(&c)
+        {
+            stack.extend(d.iter().copied());
+        }
     }
     false
 }
@@ -1113,9 +1126,10 @@ fn make_unique(col: &ColGen, rows: u64, seed: u64, table_tag: u64, window: (i64,
         (Domain::Float { lo, .. }, _) => Some(Unique::Float { start: lo.max(1.0), step: 1.0 }),
         (Domain::Text { kind, max_len, .. }, _) => {
             if let Some(m) = max_len
-                && (*m as usize) < (rows.to_string().len() + 1) {
-                    return None;
-                }
+                && (*m as usize) < (rows.to_string().len() + 1)
+            {
+                return None;
+            }
             Some(Unique::Text { kind: kind.clone(), key, max_len: *max_len })
         }
         (Domain::Fixed { n: width }, _) => {
@@ -1249,14 +1263,20 @@ fn detect_cycles(world: &World, schema: &Schema, problems: &mut Vec<String>) {
     for r in &world.relations {
         if r.child != r.parent && world.tables[r.parent].is_some() {
             let parent = world.table(r.parent);
-            let impure = r.parent_cols.iter().any(|&c| !parent.cols[c].pure || matches!(parent.cols[c].strategy, Strategy::Ref { .. } | Strategy::Product { .. }));
+            let impure = r
+                .parent_cols
+                .iter()
+                .any(|&c| !parent.cols[c].pure || matches!(parent.cols[c].strategy, Strategy::Ref { .. } | Strategy::Product { .. }));
             if impure {
                 edges.entry(r.child).or_default().insert(r.parent);
             }
         } else if r.child == r.parent {
             let t = world.table(r.child);
             if r.parent_cols.iter().any(|&c| !t.cols[c].pure || r.child_cols.contains(&c)) {
-                problems.push(format!("table {}: a column references the table itself through a column computed from the row", schema.tables[r.child].name));
+                problems.push(format!(
+                    "table {}: a column references the table itself through a column computed from the row",
+                    schema.tables[r.child].name
+                ));
             }
         }
     }
@@ -1306,10 +1326,12 @@ fn load_levels(world: &World, tables: &[TablePlan]) -> Vec<Vec<usize>> {
                 continue;
             }
             if let (Some(&lp), Some(&lc)) = (level.get(&r.parent), level.get(&r.child))
-                && lc <= lp && lp < generated.len() {
-                    level.insert(r.child, lp + 1);
-                    changed = true;
-                }
+                && lc <= lp
+                && lp < generated.len()
+            {
+                level.insert(r.child, lp + 1);
+                changed = true;
+            }
         }
         if !changed {
             break;

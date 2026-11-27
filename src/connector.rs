@@ -179,11 +179,7 @@ impl Dialect {
                 aliases => format!("{} ({})", d.name(), aliases.join(", ")),
             })
             .collect();
-        if names.is_empty() {
-            "none: this build has no connectors".into()
-        } else {
-            names.join(", ")
-        }
+        if names.is_empty() { "none: this build has no connectors".into() } else { names.join(", ") }
     }
 
     /// Every URL scheme, for messages: `postgres:, postgresql: (PostgreSQL); ...`.
@@ -192,11 +188,7 @@ impl Dialect {
             .iter()
             .map(|d| format!("{} ({})", d.schemes().iter().map(|s| format!("{s}:")).collect::<Vec<_>>().join(", "), d.product()))
             .collect();
-        if schemes.is_empty() {
-            "none: this build has no connectors".into()
-        } else {
-            schemes.join("; ")
-        }
+        if schemes.is_empty() { "none: this build has no connectors".into() } else { schemes.join("; ") }
     }
 }
 

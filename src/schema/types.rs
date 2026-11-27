@@ -13,11 +13,21 @@ use serde::Serialize;
 #[serde(rename_all = "snake_case")]
 pub enum DataType {
     Bool,
-    Int { bits: u16, signed: bool },
-    Float { bits: u16 },
-    Decimal { precision: u8, scale: u8 },
+    Int {
+        bits: u16,
+        signed: bool,
+    },
+    Float {
+        bits: u16,
+    },
+    Decimal {
+        precision: u8,
+        scale: u8,
+    },
     /// Variable-length text; `max_len` in characters when the dialect bounds it.
-    String { max_len: Option<u32> },
+    String {
+        max_len: Option<u32>,
+    },
     FixedString(u32),
     Uuid,
     /// 16-bit day count (ClickHouse `Date`, 1970-2149).
@@ -26,8 +36,14 @@ pub enum DataType {
     Date32,
     /// `precision` None: 32-bit seconds (ClickHouse `DateTime`); Some(p): 64-bit ticks of
     /// 10^-p seconds (`DateTime64(p)`, SQL `TIMESTAMP(p)`).
-    DateTime { precision: Option<u8>, tz: Option<String> },
-    Enum { bits: u8, variants: Vec<(String, i16)> },
+    DateTime {
+        precision: Option<u8>,
+        tz: Option<String>,
+    },
+    Enum {
+        bits: u8,
+        variants: Vec<(String, i16)>,
+    },
     Ipv4,
     Ipv6,
     Json,

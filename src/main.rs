@@ -207,12 +207,8 @@ enum Command {
 /// The configuration of a command: the file (given, or `dbgen.yaml` if present) under the
 /// flags.
 fn resolve(target: Target, data: Option<Data>, load: Option<Load>) -> Result<Config> {
-    let mut o = Overrides {
-        database: target.database,
-        dialect: target.dialect.map(|d| d.name().to_string()),
-        schema: target.schema,
-        ..Overrides::default()
-    };
+    let mut o =
+        Overrides { database: target.database, dialect: target.dialect.map(|d| d.name().to_string()), schema: target.schema, ..Overrides::default() };
     if let Some(d) = data {
         o.rows = d.rows;
         o.set("default_rows", d.default_rows);
@@ -247,7 +243,7 @@ fn run(command: Command) -> Result<i32> {
             match output {
                 None => print!("{text}"),
                 Some(path) if path.exists() && !force => {
-                    return Err(Error::Config(format!("{} exists; use --force to overwrite it", path.display())))
+                    return Err(Error::Config(format!("{} exists; use --force to overwrite it", path.display())));
                 }
                 Some(path) => {
                     std::fs::write(&path, text).map_err(|e| Error::Config(format!("cannot write {}: {e}", path.display())))?;

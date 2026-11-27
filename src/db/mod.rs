@@ -280,9 +280,7 @@ pub trait Backend: Send + Sync {
     fn query_u64(&self, sql: &str) -> DbResult<u64> {
         let rows = self.query_rows(sql)?;
         let cell = rows.first().and_then(|r| r.first()).cloned().flatten();
-        cell.as_deref()
-            .and_then(|s| s.trim().parse().ok())
-            .ok_or_else(|| DbError::failed(format!("unexpected result {cell:?} for: {sql}")))
+        cell.as_deref().and_then(|s| s.trim().parse().ok()).ok_or_else(|| DbError::failed(format!("unexpected result {cell:?} for: {sql}")))
     }
 
     /// The exact number of rows of `table`, as a fresh read sees them: resume compares it
@@ -303,10 +301,7 @@ pub trait Backend: Send + Sync {
         Ok(rows
             .into_iter()
             .map(|row| {
-                row.into_iter()
-                    .zip(columns)
-                    .map(|(cell, &c)| cell.map_or(Value::Null, |s| cast(Value::Str(s), &table.columns[c].ty)))
-                    .collect()
+                row.into_iter().zip(columns).map(|(cell, &c)| cell.map_or(Value::Null, |s| cast(Value::Str(s), &table.columns[c].ty))).collect()
             })
             .collect())
     }

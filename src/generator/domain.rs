@@ -3,10 +3,10 @@
 //! column gets e-mail addresses, a `*_sec` column durations, a `birth_date` past dates).
 
 use crate::expr::CmpOp;
-use crate::rng::{mix, Rng};
+use crate::rng::{Rng, mix};
 use crate::schema::DataType;
-use crate::timeutil::{days_from_civil, day_of, US_PER_DAY, US_PER_SEC};
-use crate::value::{format_uuid, Num, Value};
+use crate::timeutil::{US_PER_DAY, US_PER_SEC, day_of, days_from_civil};
+use crate::value::{Num, Value, format_uuid};
 
 use super::perm::Perm;
 use super::words::*;
@@ -105,9 +105,24 @@ impl TextKind {
         if has("uuid") || has("guid") || last == "id" {
             return TextKind::Uuid;
         }
-        if ["description", "desc", "notes", "note", "comment", "comments", "text", "message", "details", "reason", "remarks", "summary", "error", "body"]
-            .iter()
-            .any(|w| has(w))
+        if [
+            "description",
+            "desc",
+            "notes",
+            "note",
+            "comment",
+            "comments",
+            "text",
+            "message",
+            "details",
+            "reason",
+            "remarks",
+            "summary",
+            "error",
+            "body",
+        ]
+        .iter()
+        .any(|w| has(w))
         {
             return TextKind::Sentence;
         }
@@ -115,8 +130,8 @@ impl TextKind {
             return TextKind::Code;
         }
         if [
-            "status", "state", "type", "kind", "category", "level", "severity", "priority", "gender", "sex", "role", "mode", "source",
-            "channel", "resource", "lang", "language", "currency", "unit", "stage", "phase", "tier", "class", "group", "flag",
+            "status", "state", "type", "kind", "category", "level", "severity", "priority", "gender", "sex", "role", "mode", "source", "channel",
+            "resource", "lang", "language", "currency", "unit", "stage", "phase", "tier", "class", "group", "flag",
         ]
         .contains(&last)
         {
@@ -192,11 +207,7 @@ impl TextKind {
 }
 
 fn pooled_word(k: usize) -> String {
-    if k < WORDS.len() {
-        WORDS[k].to_string()
-    } else {
-        format!("{}_{}", WORDS[k % WORDS.len()], k / WORDS.len())
-    }
+    if k < WORDS.len() { WORDS[k].to_string() } else { format!("{}_{}", WORDS[k % WORDS.len()], k / WORDS.len()) }
 }
 
 fn ascii(s: &str) -> String {
@@ -232,9 +243,10 @@ pub fn table_stem(table: &str) -> String {
 pub fn strip_table_prefix(t: &str) -> String {
     for p in ["dim_", "fact_", "fct_", "d_", "f_", "tbl_", "t_", "ref_", "lkp_", "lookup_", "stg_"] {
         if let Some(rest) = t.strip_prefix(p)
-            && !rest.is_empty() {
-                return rest.to_string();
-            }
+            && !rest.is_empty()
+        {
+            return rest.to_string();
+        }
     }
     t.to_string()
 }
@@ -275,17 +287,47 @@ pub fn truncate_time(us: i64, precision: Option<u8>) -> i64 {
 /// Values distinct for every row index, by construction.
 #[derive(Debug, Clone)]
 pub enum Unique {
-    Int { start: i128, step: i128 },
-    Decimal { start: i128, step: i128, scale: u8 },
-    Float { start: f64, step: f64 },
-    Uuid { key: u64 },
-    Text { kind: TextKind, key: u64, max_len: Option<u32> },
+    Int {
+        start: i128,
+        step: i128,
+    },
+    Decimal {
+        start: i128,
+        step: i128,
+        scale: u8,
+    },
+    Float {
+        start: f64,
+        step: f64,
+    },
+    Uuid {
+        key: u64,
+    },
+    Text {
+        kind: TextKind,
+        key: u64,
+        max_len: Option<u32>,
+    },
     /// FixedString(n): the index in base 36, left-padded.
-    Fixed { n: u32 },
-    Time { start: i64, step: i64, precision: Option<u8>, key: u64 },
-    Date { start: i32, step: i32 },
-    Ip4 { start: u32 },
-    Ip6 { start: u128 },
+    Fixed {
+        n: u32,
+    },
+    Time {
+        start: i64,
+        step: i64,
+        precision: Option<u8>,
+        key: u64,
+    },
+    Date {
+        start: i32,
+        step: i32,
+    },
+    Ip4 {
+        start: u32,
+    },
+    Ip6 {
+        start: u128,
+    },
 }
 
 impl Unique {
@@ -334,24 +376,67 @@ fn base36(mut i: u64, width: usize) -> String {
 /// A domain of random values.
 #[derive(Debug, Clone)]
 pub enum Domain {
-    Values { values: Vec<Value>, cumulative: Vec<u64> },
-    Int { lo: i128, hi: i128 },
-    Float { lo: f64, hi: f64 },
-    Decimal { lo: i128, hi: i128, scale: u8 },
-    Bool { p_true: f64 },
-    Time { lo: i64, hi: i64, precision: Option<u8> },
+    Values {
+        values: Vec<Value>,
+        cumulative: Vec<u64>,
+    },
+    Int {
+        lo: i128,
+        hi: i128,
+    },
+    Float {
+        lo: f64,
+        hi: f64,
+    },
+    Decimal {
+        lo: i128,
+        hi: i128,
+        scale: u8,
+    },
+    Bool {
+        p_true: f64,
+    },
+    Time {
+        lo: i64,
+        hi: i64,
+        precision: Option<u8>,
+    },
     /// Spread over `[lo, hi)` in row order: row `i` of `rows` falls in the `i`-th slice.
     /// Used for partitioning columns, so each batch touches few partitions.
-    Ordered { lo: i64, hi: i64, rows: u64, precision: Option<u8>, date: bool },
-    Date { lo: i32, hi: i32 },
+    Ordered {
+        lo: i64,
+        hi: i64,
+        rows: u64,
+        precision: Option<u8>,
+        date: bool,
+    },
+    Date {
+        lo: i32,
+        hi: i32,
+    },
     Uuid,
-    Text { kind: TextKind, max_len: Option<u32>, pool: Option<u32> },
-    Fixed { n: u32 },
+    Text {
+        kind: TextKind,
+        max_len: Option<u32>,
+        pool: Option<u32>,
+    },
+    Fixed {
+        n: u32,
+    },
     Ip4,
     Ip6,
     Json,
-    Array { min: u32, max: u32, elem: Box<Elem> },
-    Map { min: u32, max: u32, key: Box<Elem>, value: Box<Elem> },
+    Array {
+        min: u32,
+        max: u32,
+        elem: Box<Elem>,
+    },
+    Map {
+        min: u32,
+        max: u32,
+        key: Box<Elem>,
+        value: Box<Elem>,
+    },
     Tuple(Vec<Elem>),
     /// For types dbgen cannot generate: always NULL.
     Null,
@@ -395,20 +480,17 @@ impl Domain {
                 let span = (hi - lo) as f64;
                 let pos = (i as f64 + rng.f64()) / (*rows).max(1) as f64;
                 let t = lo + (span * pos.min(0.999_999_999)) as i64;
-                if *date {
-                    Value::Date(day_of(t) as i32)
-                } else {
-                    Value::Time(truncate_time(t, *precision))
-                }
+                if *date { Value::Date(day_of(t) as i32) } else { Value::Time(truncate_time(t, *precision)) }
             }
             Domain::Date { lo, hi } => Value::Date(rng.between_i128(*lo as i128, *hi as i128) as i32),
             Domain::Uuid => Value::Uuid(rng.uuid_v4()),
             Domain::Text { kind, max_len, pool } => {
                 let mut s = kind.render(rng, *pool);
                 if let Some(m) = max_len
-                    && s.chars().count() > *m as usize {
-                        s = s.chars().take(*m as usize).collect();
-                    }
+                    && s.chars().count() > *m as usize
+                {
+                    s = s.chars().take(*m as usize).collect();
+                }
                 Value::Str(s)
             }
             Domain::Fixed { n } => Value::Str((0..*n).map(|_| (b'A' + rng.below(26) as u8) as char).collect()),
@@ -631,11 +713,7 @@ pub fn default_domain(ty: &DataType, table: &str, column: &str, window: (i64, i6
             } else {
                 (day_of(window.0) as i32, (day_of(window.1 - 1)) as i32)
             };
-            if date16 {
-                Domain::Date { lo: lo.clamp(0, 65_535), hi: hi.clamp(0, 65_535) }
-            } else {
-                Domain::Date { lo, hi }
-            }
+            if date16 { Domain::Date { lo: lo.clamp(0, 65_535), hi: hi.clamp(0, 65_535) } } else { Domain::Date { lo, hi } }
         }
         DataType::DateTime { precision, .. } => {
             let (mut lo, mut hi) = (window.0, window.1 - 1);
@@ -655,12 +733,9 @@ pub fn default_domain(ty: &DataType, table: &str, column: &str, window: (i64, i6
         DataType::Ipv6 => Domain::Ip6,
         DataType::Json => Domain::Json,
         DataType::Array(t) => Domain::Array { min: 0, max: 5, elem: Box::new(elem(t, table, column, window)) },
-        DataType::Map(k, v) => Domain::Map {
-            min: 0,
-            max: 3,
-            key: Box::new(elem(k, table, column, window)),
-            value: Box::new(elem(v, table, column, window)),
-        },
+        DataType::Map(k, v) => {
+            Domain::Map { min: 0, max: 3, key: Box::new(elem(k, table, column, window)), value: Box::new(elem(v, table, column, window)) }
+        }
         DataType::Tuple(items) => Domain::Tuple(items.iter().map(|(n, t)| elem(t, table, n.as_deref().unwrap_or(column), window)).collect()),
         DataType::Nullable(_) | DataType::LowCardinality(_) => unreachable!("base() strips wrappers"),
         DataType::Unsupported(_) => Domain::Null,

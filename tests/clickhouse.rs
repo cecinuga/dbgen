@@ -8,12 +8,12 @@
 use std::path::{Path, PathBuf};
 
 use dbgen::config::Config;
-use dbgen::db::clickhouse::{encode, Client};
+use dbgen::db::clickhouse::{Client, encode};
 use dbgen::dialect::Dialect;
 use dbgen::plan;
 use dbgen::run::{self, GenerateOptions};
 use dbgen::schema::{self, DataType};
-use dbgen::value::{parse_uuid, Value};
+use dbgen::value::{Value, parse_uuid};
 
 fn server() -> Option<String> {
     match std::env::var("DBGEN_TEST_CLICKHOUSE_URL") {

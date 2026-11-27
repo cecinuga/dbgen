@@ -6,7 +6,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 
-use crate::timeutil::{day_of, Rfc3339, Ymd, US_PER_DAY};
+use crate::timeutil::{Rfc3339, US_PER_DAY, Ymd, day_of};
 
 /// A value of any column type, or NULL.
 #[derive(Debug, Clone, PartialEq)]
@@ -89,9 +89,7 @@ impl Value {
             (Ip4(a), Ip4(b)) => Some(a.cmp(b)),
             (Ip6(a), Ip6(b)) => Some(a.cmp(b)),
             (Date(a), Date(b)) => Some(a.cmp(b)),
-            (Time(_) | Date(_), Time(_) | Date(_) | Str(_)) | (Str(_), Time(_) | Date(_)) => {
-                Some(self.as_time()?.cmp(&other.as_time()?))
-            }
+            (Time(_) | Date(_), Time(_) | Date(_) | Str(_)) | (Str(_), Time(_) | Date(_)) => Some(self.as_time()?.cmp(&other.as_time()?)),
             (Interval(a), Interval(b)) => Some(a.cmp(b)),
             (Array(a), Array(b)) | (Tuple(a), Tuple(b)) => {
                 for (x, y) in a.iter().zip(b) {
@@ -235,11 +233,7 @@ impl Num {
     }
 
     fn from_scaled(v: i128, s: u8) -> Num {
-        if s == 0 {
-            Num::I(v)
-        } else {
-            Num::D(v, s)
-        }
+        if s == 0 { Num::I(v) } else { Num::D(v, s) }
     }
 
     pub fn add(a: Num, b: Num) -> Option<Num> {
@@ -279,11 +273,7 @@ impl Num {
             (Num::I(x), Num::I(y)) if y != 0 => Some(Num::I(x % y)),
             _ => {
                 let d = b.to_f64();
-                if d == 0.0 {
-                    None
-                } else {
-                    Some(Num::F(a.to_f64() % d))
-                }
+                if d == 0.0 { None } else { Some(Num::F(a.to_f64() % d)) }
             }
         }
     }
@@ -318,11 +308,7 @@ impl Num {
             }
             Num::F(f) => {
                 let v = (f * 10f64.powi(scale as i32)).round();
-                if v.is_finite() && v.abs() < 1.7e38 {
-                    Some(v as i128)
-                } else {
-                    None
-                }
+                if v.is_finite() && v.abs() < 1.7e38 { Some(v as i128) } else { None }
             }
         }
     }

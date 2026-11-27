@@ -111,7 +111,8 @@ impl Summary {
         );
         let _ = writeln!(s, "{rule}");
         for t in &self.tables {
-            let inserted = if t.resumed_rows > 0 { format!("{}+{}", thousands(t.inserted_rows), thousands(t.resumed_rows)) } else { thousands(t.inserted_rows) };
+            let inserted =
+                if t.resumed_rows > 0 { format!("{}+{}", thousands(t.inserted_rows), thousands(t.resumed_rows)) } else { thousands(t.inserted_rows) };
             let _ = writeln!(
                 s,
                 "{:<32} {:>13} {:>15} {:>13} {:>10} {:>9} {:>11} {:>7}  {:?}",
@@ -133,7 +134,12 @@ impl Summary {
         let finals: u64 = self.tables.iter().filter_map(|t| t.final_rows).sum();
         let mib: f64 = self.tables.iter().map(|t| t.mib).sum();
         let _ = writeln!(s, "Total Target Rows:    {}", thousands(target));
-        let _ = writeln!(s, "Total Inserted Rows:  {}{}", thousands(inserted), if resumed > 0 { format!(" (+{} resumed)", thousands(resumed)) } else { String::new() });
+        let _ = writeln!(
+            s,
+            "Total Inserted Rows:  {}{}",
+            thousands(inserted),
+            if resumed > 0 { format!(" (+{} resumed)", thousands(resumed)) } else { String::new() }
+        );
         let _ = writeln!(s, "Total Final Rows:     {}", thousands(finals));
         let _ = writeln!(
             s,

@@ -34,11 +34,7 @@ pub fn load_schema(config: &Config) -> Result<Schema> {
 
 /// Like [`load_schema`], reusing a connected database when the schema is read from it.
 fn load_schema_with(config: &Config, db: &Database) -> Result<Schema> {
-    if config.schema.is_empty() {
-        schema_from_database(config, db)
-    } else {
-        schema_from_files(config)
-    }
+    if config.schema.is_empty() { schema_from_database(config, db) } else { schema_from_files(config) }
 }
 
 fn schema_from_files(config: &Config) -> Result<Schema> {
@@ -109,7 +105,11 @@ pub fn init(config: &Config, rows: u64) -> Result<String> {
     }
     let g = &config.generation;
     let _ = writeln!(s, "\ngeneration:\n  seed: {}\n  history_days: {}", g.seed, g.history_days);
-    let _ = writeln!(s, "  end_time: \"{}\"", g.end_time.clone().unwrap_or_else(|| crate::timeutil::Ymd(crate::timeutil::day_of(crate::timeutil::today_utc_midnight())).to_string()));
+    let _ = writeln!(
+        s,
+        "  end_time: \"{}\"",
+        g.end_time.clone().unwrap_or_else(|| crate::timeutil::Ymd(crate::timeutil::day_of(crate::timeutil::today_utc_midnight())).to_string())
+    );
     let _ = writeln!(s, "\ntables:");
     for t in &schema.tables {
         let (value, note) = match () {
@@ -143,11 +143,7 @@ fn yaml_quote(s: &str) -> String {
 }
 
 fn yaml_key(s: &str) -> String {
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        s.to_string()
-    } else {
-        yaml_quote(s)
-    }
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { s.to_string() } else { yaml_quote(s) }
 }
 
 /// The compiled schema as text, for `dbgen inspect`.
@@ -187,9 +183,13 @@ pub fn render_schema(schema: &Schema) -> String {
             let _ = writeln!(s, "  {:<34} {:<36}{extra}", c.name, c.ty.to_string());
         }
         for k in &t.keys {
-            let parts: Vec<&str> = k.parts.iter().map(|p| match p {
-                KeyPart::Column(c) | KeyPart::Expr(c) => c.as_str(),
-            }).collect();
+            let parts: Vec<&str> = k
+                .parts
+                .iter()
+                .map(|p| match p {
+                    KeyPart::Column(c) | KeyPart::Expr(c) => c.as_str(),
+                })
+                .collect();
             let _ = writeln!(s, "  KEY {:?} ({})", k.kind, parts.join(", "));
         }
         for fk in &t.foreign_keys {
@@ -239,11 +239,7 @@ fn check_live(db: &Database, schema: &Schema, plan: &Plan) -> Result<()> {
             }
         }
     }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::Validation(format!("the database does not match the DDL input:\n{}", bullets(&problems))))
-    }
+    if problems.is_empty() { Ok(()) } else { Err(Error::Validation(format!("the database does not match the DDL input:\n{}", bullets(&problems)))) }
 }
 
 fn bullets(items: &[String]) -> String {
@@ -388,7 +384,15 @@ pub fn generate_config(config: Config, opts: &GenerateOptions) -> Result<Outcome
     let progress = Progress::start(stats.clone(), opts.progress_bars, Duration::from_secs(g.progress_interval_secs.max(1)));
     let state = Arc::new(Mutex::new(st));
     let load_started = Instant::now();
-    let load = Load { config: &p.config, schema: &p.schema, plan: &p.plan, db: &p.db, stats: stats.clone(), state: state.clone(), state_path: state_path.clone() };
+    let load = Load {
+        config: &p.config,
+        schema: &p.schema,
+        plan: &p.plan,
+        db: &p.db,
+        stats: stats.clone(),
+        state: state.clone(),
+        state_path: state_path.clone(),
+    };
     let result = load.run();
     let load_seconds = load_started.elapsed().as_secs_f64();
     progress.stop();

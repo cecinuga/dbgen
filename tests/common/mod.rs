@@ -318,7 +318,8 @@ pub fn atomic_batches(server: &Server, name: &str) {
     let batch = |copies: usize| {
         let mut b = Batch::default();
         for _ in 0..copies {
-            db.encode_row(&mut b.body, &RowRef { types: &types, values: &row, columns: &positions }).unwrap_or_else(|e| panic!("encoding: {}", e.message));
+            db.encode_row(&mut b.body, &RowRef { types: &types, values: &row, columns: &positions })
+                .unwrap_or_else(|e| panic!("encoding: {}", e.message));
             b.row_ends.push(b.body.len());
         }
         b
@@ -448,7 +449,10 @@ fn round_trip(server: &Server, name: &str, sql: &Path, body: &str) -> Result<Vec
                 differences.push(format!("only on the introspected plan: {w}"));
             }
             let samples = |p: &plan::Plan| -> BTreeMap<String, String> {
-                plan::sample(p, 500).into_iter().map(|r| (r.table, format!("{} of {} rows repaired, error {:?}", r.repaired, r.sampled, r.error))).collect()
+                plan::sample(p, 500)
+                    .into_iter()
+                    .map(|r| (r.table, format!("{} of {} rows repaired, error {:?}", r.repaired, r.sampled, r.error)))
+                    .collect()
             };
             let (d, l) = (samples(&declared_plan), samples(&live_plan));
             for (table, sample) in &d {
@@ -478,7 +482,8 @@ struct Shape {
 }
 
 fn shapes(schema: &Schema) -> BTreeMap<String, Shape> {
-    let primary_key = |table: &str| schema.table(table).and_then(|t| t.primary_key()).map(|k| k.iter().map(|c| c.to_string()).collect()).unwrap_or_default();
+    let primary_key =
+        |table: &str| schema.table(table).and_then(|t| t.primary_key()).map(|k| k.iter().map(|c| c.to_string()).collect()).unwrap_or_default();
     schema
         .tables
         .iter()
@@ -551,4 +556,3 @@ fn shape_differences(declared: &Schema, live: &Schema) -> Vec<String> {
     }
     out
 }
-

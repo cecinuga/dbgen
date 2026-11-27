@@ -79,9 +79,14 @@ impl State {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(Error::Config(format!("cannot read resume state {}: {e}", path.display()))),
         };
-        let mut s: State = serde_json::from_str(&text).map_err(|e| Error::Config(format!("resume state {} is corrupt ({e}); delete it and use --reset", path.display())))?;
+        let mut s: State = serde_json::from_str(&text)
+            .map_err(|e| Error::Config(format!("resume state {} is corrupt ({e}); delete it and use --reset", path.display())))?;
         if s.format != FORMAT {
-            return Err(Error::Config(format!("resume state {} has format {}, this dbgen writes {FORMAT}; delete it and use --reset", path.display(), s.format)));
+            return Err(Error::Config(format!(
+                "resume state {} has format {}, this dbgen writes {FORMAT}; delete it and use --reset",
+                path.display(),
+                s.format
+            )));
         }
         for t in s.tables.values_mut() {
             t.expand();
@@ -100,7 +105,9 @@ impl State {
         }
         let tmp = path.with_extension("json.tmp");
         let text = serde_json::to_string_pretty(self).expect("serializable");
-        std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, path)).map_err(|e| Error::Config(format!("cannot write {}: {e}", path.display())))
+        std::fs::write(&tmp, text)
+            .and_then(|_| std::fs::rename(&tmp, path))
+            .map_err(|e| Error::Config(format!("cannot write {}: {e}", path.display())))
     }
 
     /// The state of table `name`, created empty if needed.

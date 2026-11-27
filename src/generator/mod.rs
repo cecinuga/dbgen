@@ -16,8 +16,8 @@ pub mod words;
 
 use std::fmt;
 
-use crate::expr::{eval, holds, CExpr, EvalCtx};
-use crate::rng::{hash, unit, Rng};
+use crate::expr::{CExpr, EvalCtx, eval, holds};
+use crate::rng::{Rng, hash, unit};
 use crate::schema::DataType;
 use crate::value::Value;
 
@@ -40,12 +40,25 @@ pub enum Strategy {
     /// Distinct for every row, by construction.
     Unique(Unique),
     /// Part `part` of the referenced key of relation `rel`.
-    Ref { rel: usize, part: usize },
+    Ref {
+        rel: usize,
+        part: usize,
+    },
     /// Component `comp` (part `part`) of a composite key enumerated without repeats.
-    Product { key: usize, comp: usize, part: usize },
+    Product {
+        key: usize,
+        comp: usize,
+        part: usize,
+    },
     Random(Domain),
     /// A timestamp `gap` after column `base` of the same row.
-    After { base: usize, min_gap: i64, max_gap: i64, precision: Option<u8>, date: bool },
+    After {
+        base: usize,
+        min_gap: i64,
+        max_gap: i64,
+        precision: Option<u8>,
+        date: bool,
+    },
     /// Computed from other columns so that an equality CHECK holds.
     Derived(CExpr),
 }
@@ -120,14 +133,20 @@ pub struct ExistingRows {
 pub enum Pick {
     Uniform,
     /// Power-law: `floor(n * u^skew)`, scattered by a permutation.
-    Skewed { skew: f64, perm: Perm },
+    Skewed {
+        skew: f64,
+        perm: Perm,
+    },
     /// One-to-one: child row `i` -> parent row `perm(i)`.
     Injective(Perm),
     /// A row of the same table before the child row. Row 0 references itself when the
     /// column cannot be NULL.
     Earlier,
     /// Chosen by the enumeration of a composite key.
-    Product { key: usize, comp: usize },
+    Product {
+        key: usize,
+        comp: usize,
+    },
 }
 
 /// A relation between generated tables, or to rows read from the database.
@@ -208,14 +227,7 @@ pub struct RowError {
 
 impl fmt::Display for RowError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "table {}, row {}: could not satisfy {} (last attempt: {})",
-            self.table,
-            self.row,
-            self.checks.join(", "),
-            self.values
-        )
+        write!(f, "table {}, row {}: could not satisfy {} (last attempt: {})", self.table, self.row, self.checks.join(", "), self.values)
     }
 }
 
@@ -505,11 +517,7 @@ fn fit(v: Value, ty: &DataType) -> Value {
         },
         (Value::Decimal(x, _), DataType::Decimal { precision, .. }) => {
             let max = 10i128.checked_pow(*precision as u32).unwrap_or(i128::MAX);
-            if x.abs() >= max {
-                Value::Null
-            } else {
-                v
-            }
+            if x.abs() >= max { Value::Null } else { v }
         }
         _ => v,
     }

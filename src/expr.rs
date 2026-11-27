@@ -11,14 +11,13 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use sqlparser::ast::{
-    BinaryOperator as B, DateTimeField, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, UnaryOperator as U,
-    Value as SqlValue,
+    BinaryOperator as B, DateTimeField, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, UnaryOperator as U, Value as SqlValue,
 };
 
 use crate::schema::DataType;
-use crate::sql::convert::{data_type, TypeRules};
-use crate::timeutil::{civil_from_days, day_of, days_from_civil, US_PER_DAY, US_PER_HOUR, US_PER_MIN, US_PER_SEC};
-use crate::value::{date_of_time, parse_uuid, Num, Value};
+use crate::sql::convert::{TypeRules, data_type};
+use crate::timeutil::{US_PER_DAY, US_PER_HOUR, US_PER_MIN, US_PER_SEC, civil_from_days, day_of, days_from_civil};
+use crate::value::{Num, Value, date_of_time, parse_uuid};
 
 /// A comparison operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,11 +463,7 @@ pub fn eval(e: &CExpr, row: &[Value], ctx: &EvalCtx) -> Value {
                     _ => {}
                 }
             }
-            if saw_null {
-                Value::Null
-            } else {
-                Value::Bool(*negated)
-            }
+            if saw_null { Value::Null } else { Value::Bool(*negated) }
         }
         CExpr::Between(x, lo, hi, negated) => {
             let v = eval(x, row, ctx);
@@ -608,11 +603,7 @@ fn call(f: Func, args: &[CExpr], row: &[Value], ctx: &EvalCtx) -> Value {
         Func::Coalesce => args.iter().map(|a| eval(a, row, ctx)).find(|v| !v.is_null()).unwrap_or(Value::Null),
         Func::NullIf => {
             let a = arg(0);
-            if a.compare(&arg(1)) == Some(Ordering::Equal) {
-                Value::Null
-            } else {
-                a
-            }
+            if a.compare(&arg(1)) == Some(Ordering::Equal) { Value::Null } else { a }
         }
         Func::Identity => arg(0),
         Func::If => {
@@ -919,9 +910,10 @@ impl CExpr {
                 if let CExpr::Col(c) = &**x {
                     for i in items {
                         if let CExpr::Lit(v) = i
-                            && !v.is_null() {
-                                out.push((*c, v.clone()));
-                            }
+                            && !v.is_null()
+                        {
+                            out.push((*c, v.clone()));
+                        }
                     }
                 }
             }
@@ -959,10 +951,13 @@ impl CExpr {
         match self {
             CExpr::In(x, items, false) => {
                 let CExpr::Col(c) = &**x else { return None };
-                let vals: Option<Vec<Value>> = items.iter().map(|i| match i {
-                    CExpr::Lit(v) if !v.is_null() => Some(v.clone()),
-                    _ => None,
-                }).collect();
+                let vals: Option<Vec<Value>> = items
+                    .iter()
+                    .map(|i| match i {
+                        CExpr::Lit(v) if !v.is_null() => Some(v.clone()),
+                        _ => None,
+                    })
+                    .collect();
                 Some((*c, vals?))
             }
             CExpr::Cmp(CmpOp::Eq, l, r) => match (&**l, &**r) {
@@ -981,9 +976,10 @@ impl CExpr {
         let mut out = Vec::new();
         for (side, other) in [(&**l, &**r), (&**r, &**l)] {
             if let CExpr::Col(c) = side
-                && !other.references(*c) {
-                    out.push((*c, other.clone()));
-                }
+                && !other.references(*c)
+            {
+                out.push((*c, other.clone()));
+            }
             // Linear isolation over a sum of signed terms.
             let mut terms = Vec::new();
             if flatten_sum(side, true, &mut terms) && terms.len() >= 2 {
@@ -993,13 +989,9 @@ impl CExpr {
                         continue;
                     }
                     // c = other - rest (if +c) or rest - other (if -c).
-                    let rest = terms
-                        .iter()
-                        .enumerate()
-                        .filter(|(j, _)| *j != k)
-                        .fold(CExpr::Lit(Value::Int(0)), |acc, (_, (t, pos))| {
-                            CExpr::Arith(if *pos { ArithOp::Add } else { ArithOp::Sub }, b(acc), b(t.clone()))
-                        });
+                    let rest = terms.iter().enumerate().filter(|(j, _)| *j != k).fold(CExpr::Lit(Value::Int(0)), |acc, (_, (t, pos))| {
+                        CExpr::Arith(if *pos { ArithOp::Add } else { ArithOp::Sub }, b(acc), b(t.clone()))
+                    });
                     let rhs = if *positive {
                         CExpr::Arith(ArithOp::Sub, b(other.clone()), b(rest))
                     } else {
@@ -1019,11 +1011,7 @@ impl CExpr {
             CExpr::Cmp(op @ (CmpOp::Gt | CmpOp::Ge | CmpOp::Lt | CmpOp::Le), l, r) => match (&**l, &**r) {
                 (CExpr::Col(a), CExpr::Col(c)) => {
                     let strict = matches!(op, CmpOp::Gt | CmpOp::Lt);
-                    if matches!(op, CmpOp::Gt | CmpOp::Ge) {
-                        Some((*a, *c, strict))
-                    } else {
-                        Some((*c, *a, strict))
-                    }
+                    if matches!(op, CmpOp::Gt | CmpOp::Ge) { Some((*a, *c, strict)) } else { Some((*c, *a, strict)) }
                 }
                 _ => None,
             },
@@ -1034,9 +1022,10 @@ impl CExpr {
                 for (x, y) in [(&**l, &**r), (&**r, &**l)] {
                     if let CExpr::IsNull(n, false) = x
                         && let (CExpr::Col(nc), Some(o)) = (&**n, cmp(y))
-                            && (*nc == o.0 || *nc == o.1) {
-                                return Some(o);
-                            }
+                        && (*nc == o.0 || *nc == o.1)
+                    {
+                        return Some(o);
+                    }
                 }
                 None
             }

@@ -457,9 +457,10 @@ impl Schema {
             for key in &t.keys {
                 for part in &key.parts {
                     if let KeyPart::Column(c) = part
-                        && !t.columns.iter().any(|col| &col.name == c) {
-                            self.warnings.push(format!("table {}: {} names column {c}, which does not exist", t.name, key.name));
-                        }
+                        && !t.columns.iter().any(|col| &col.name == c)
+                    {
+                        self.warnings.push(format!("table {}: {} names column {c}, which does not exist", t.name, key.name));
+                    }
                 }
             }
         }
@@ -517,7 +518,9 @@ fn alter(t: &mut Table, action: AlterAction, warnings: &mut Vec<String>) -> std:
             let col = column_from(column);
             let at = match after {
                 Some(ColumnPosition::First) => 0,
-                Some(ColumnPosition::After(a)) => find(t, &a).map(|i| i + 1).ok_or_else(|| format!("ALTER TABLE {table}: AFTER {a}: no such column"))?,
+                Some(ColumnPosition::After(a)) => {
+                    find(t, &a).map(|i| i + 1).ok_or_else(|| format!("ALTER TABLE {table}: AFTER {a}: no such column"))?
+                }
                 None => t.columns.len(),
             };
             t.columns.insert(at, col);

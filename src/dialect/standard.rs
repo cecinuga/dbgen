@@ -18,8 +18,8 @@ use sqlparser::tokenizer::Token;
 use crate::schema::DataType;
 use crate::sql::convert::{self, Constraint, TypeRules};
 use crate::sql::{
-    are_kws, is_kw, parse_slice, read_name, unqualified, word, AlterAction, ColumnPosition, ColumnSpec, Ddl, DefaultKind, DefaultSpec,
-    Diag, Statement, TableDef,
+    AlterAction, ColumnPosition, ColumnSpec, Ddl, DefaultKind, DefaultSpec, Diag, Statement, TableDef, are_kws, is_kw, parse_slice, read_name,
+    unqualified, word,
 };
 
 /// What a statement can do to the schema, judged from its leading keywords.
@@ -43,10 +43,7 @@ fn classify(stmt: &Statement) -> Kind {
         while ["GLOBAL", "LOCAL", "UNLOGGED"].iter().any(|kw| is_kw(t.get(i), kw)) {
             i += 1;
         }
-        let structural = is_kw(t.get(i), "TABLE")
-            || are_kws(t, i, &["UNIQUE", "INDEX"])
-            || is_kw(t.get(i), "TYPE")
-            || is_kw(t.get(i), "DOMAIN");
+        let structural = is_kw(t.get(i), "TABLE") || are_kws(t, i, &["UNIQUE", "INDEX"]) || is_kw(t.get(i), "TYPE") || is_kw(t.get(i), "DOMAIN");
         return if structural { Kind::Structure } else { Kind::Other };
     }
     if are_kws(t, 0, &["ALTER", "TABLE"]) || are_kws(t, 0, &["RENAME", "TABLE"]) {
@@ -80,7 +77,7 @@ pub fn parse_statement(stmt: &Statement, sql: &dyn SqlDialect, rules: &TypeRules
             return Ok(match read_name(&stmt.toks, i) {
                 Some((table, _)) => Ddl::Insert { table },
                 None => Ddl::Ignored(leading_words(stmt, 2)),
-            })
+            });
         }
         Kind::Structure => {}
     }
@@ -267,11 +264,15 @@ pub fn parse_type(s: &str, sql: &dyn SqlDialect, rules: &TypeRules) -> Result<Da
 mod tests {
     use super::*;
     use crate::dialect::Dialect;
-    use crate::sql::{split, Source};
+    use crate::sql::{Source, split};
 
     fn parse(dialect: Dialect, sql: &str) -> Vec<Ddl> {
         let src = Source::new("test.sql", sql.to_string());
-        split(&src, dialect.sql()).unwrap().iter().map(|s| parse_statement(s, dialect.sql(), &dialect.type_rules()).unwrap_or_else(|e| panic!("{e}"))).collect()
+        split(&src, dialect.sql())
+            .unwrap()
+            .iter()
+            .map(|s| parse_statement(s, dialect.sql(), &dialect.type_rules()).unwrap_or_else(|e| panic!("{e}")))
+            .collect()
     }
 
     #[test]
@@ -338,7 +339,8 @@ mod tests {
         let Ddl::AlterTable { actions, .. } = &ddl[1] else { panic!() };
         assert!(matches!(&actions[0], AlterAction::ReplaceColumn { column, .. } if column.ty.is_nullable()));
 
-        let ddl = parse(Dialect::Sqlite, "CREATE TABLE IF NOT EXISTS s (id INTEGER PRIMARY KEY, anything, n REAL NOT NULL); PRAGMA foreign_keys = ON;");
+        let ddl =
+            parse(Dialect::Sqlite, "CREATE TABLE IF NOT EXISTS s (id INTEGER PRIMARY KEY, anything, n REAL NOT NULL); PRAGMA foreign_keys = ON;");
         let Ddl::CreateTable(def) = &ddl[0] else { panic!() };
         assert_eq!(def.columns[1].ty, DataType::Nullable(Box::new(DataType::String { max_len: None })));
         assert!(matches!(&ddl[1], Ddl::Ignored(w) if w == "PRAGMA FOREIGN_KEYS"));

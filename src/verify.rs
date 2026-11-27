@@ -72,9 +72,17 @@ pub fn run(db: &Database, schema: &Schema, plan: &Plan) -> Vec<CheckResult> {
                     KeyPart::Expr(s) => s.clone(),
                 })
                 .collect();
-            let name = format!("unique.{}.({})", t.name, key.parts.iter().map(|p| match p {
-                KeyPart::Column(c) | KeyPart::Expr(c) => c.as_str(),
-            }).collect::<Vec<_>>().join(", "));
+            let name = format!(
+                "unique.{}.({})",
+                t.name,
+                key.parts
+                    .iter()
+                    .map(|p| match p {
+                        KeyPart::Column(c) | KeyPart::Expr(c) => c.as_str(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             out.push(counted(name, &db.duplicates_sql(t, &parts), db, "duplicate rows"));
         }
         if let Some(sql) = db.collapsed_sql(t) {

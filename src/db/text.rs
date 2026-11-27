@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 
 use crate::schema::DataType;
 use crate::timeutil::{SqlTimestamp, Ymd};
-use crate::value::{format_decimal, format_uuid, Value};
+use crate::value::{Value, format_decimal, format_uuid};
 
 /// How a database spells booleans and escapes strings in SQL text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

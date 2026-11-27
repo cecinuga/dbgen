@@ -302,7 +302,7 @@ impl Config {
                 return Err(Error::Config(format!(
                     "{}: no database: set `database` (--database), or `dialect` (--dialect) to work without one",
                     path.display()
-                )))
+                )));
             }
         };
         let schema = match raw.schema {
@@ -323,13 +323,13 @@ impl Config {
         let mut tables = BTreeMap::new();
         for (name, v) in raw.tables {
             let target = match &v {
-                Yaml::Number(n) => TableTarget::Rows(n.as_u64().ok_or_else(|| Error::Config(format!("tables.{name}: expected a row count, got {n}")))?),
+                Yaml::Number(n) => {
+                    TableTarget::Rows(n.as_u64().ok_or_else(|| Error::Config(format!("tables.{name}: expected a row count, got {n}")))?)
+                }
                 Yaml::String(s) if s.eq_ignore_ascii_case("existing") => TableTarget::Existing,
                 Yaml::String(s) if s.eq_ignore_ascii_case("skip") => TableTarget::Skip,
                 Yaml::Null => TableTarget::Skip,
-                other => {
-                    return Err(Error::Config(format!("tables.{name}: expected a row count, 'existing' or 'skip', got {}", yaml_str(other))))
-                }
+                other => return Err(Error::Config(format!("tables.{name}: expected a row count, 'existing' or 'skip', got {}", yaml_str(other)))),
             };
             tables.insert(name, target);
         }
@@ -337,12 +337,18 @@ impl Config {
         for (i, r) in raw.relations.into_iter().enumerate() {
             let rel = match r {
                 Yaml::String(s) => {
-                    let (from, to) = s.split_once("->").ok_or_else(|| Error::Config(format!("relations[{i}]: '{s}' is not 'child.col -> parent.col'")))?;
+                    let (from, to) =
+                        s.split_once("->").ok_or_else(|| Error::Config(format!("relations[{i}]: '{s}' is not 'child.col -> parent.col'")))?;
                     RelationConfig { from: parse_ref(from, i)?, to: parse_ref(to, i)?, distribution: Distribution::Uniform, skew: 1.5 }
                 }
                 other => {
                     let raw: RawRelation = serde_yaml_ng::from_value(other).map_err(|e| Error::Config(format!("relations[{i}]: {e}")))?;
-                    RelationConfig { from: parse_ref(&raw.from, i)?, to: parse_ref(&raw.to, i)?, distribution: raw.distribution, skew: raw.skew.unwrap_or(1.5) }
+                    RelationConfig {
+                        from: parse_ref(&raw.from, i)?,
+                        to: parse_ref(&raw.to, i)?,
+                        distribution: raw.distribution,
+                        skew: raw.skew.unwrap_or(1.5),
+                    }
                 }
             };
             if rel.from.columns.len() != rel.to.columns.len() {
@@ -353,13 +359,18 @@ impl Config {
             }
             relations.push(rel);
         }
-        let ignore_relations = raw.ignore_relations.iter().map(|s| ColumnRef::parse(s).map_err(|e| Error::Config(format!("ignore_relations: {e}")))).collect::<Result<_>>()?;
+        let ignore_relations = raw
+            .ignore_relations
+            .iter()
+            .map(|s| ColumnRef::parse(s).map_err(|e| Error::Config(format!("ignore_relations: {e}"))))
+            .collect::<Result<_>>()?;
         for (k, c) in &raw.columns {
             ColumnRef::parse(k).map_err(|e| Error::Config(format!("columns: {e}")))?;
             if let (Some(v), Some(w)) = (&c.values, &c.weights)
-                && v.len() != w.len() {
-                    return Err(Error::Config(format!("columns.{k}: values and weights have different lengths")));
-                }
+                && v.len() != w.len()
+            {
+                return Err(Error::Config(format!("columns.{k}: values and weights have different lengths")));
+            }
             if c.null_rate.is_some_and(|r| !(0.0..=1.0).contains(&r)) {
                 return Err(Error::Config(format!("columns.{k}.null_rate must be between 0 and 1")));
             }
@@ -528,12 +539,8 @@ pub fn yaml_str(v: &Yaml) -> String {
 /// The connector a URL points at, from its scheme.
 fn dialect_of_url(url: &str) -> Result<Dialect> {
     let scheme = url.split(':').next().unwrap_or_default();
-    Dialect::from_scheme(scheme).ok_or_else(|| {
-        Error::Config(format!(
-            "database: '{scheme}:' URLs are not supported; this build knows {}",
-            Dialect::known_schemes()
-        ))
-    })
+    Dialect::from_scheme(scheme)
+        .ok_or_else(|| Error::Config(format!("database: '{scheme}:' URLs are not supported; this build knows {}", Dialect::known_schemes())))
 }
 
 /// Expands `${VAR}` from the environment.
@@ -635,7 +642,10 @@ mod override_tests {
         o.set("seed", Some(9u64));
         let c = Config::resolve(Some(&path), &o).unwrap();
         assert_eq!((c.generation.seed, c.generation.workers), (9, 2));
-        assert_eq!((c.tables["a"].clone(), c.tables["b"].clone(), c.tables["c"].clone()), (TableTarget::Rows(1), TableTarget::Rows(20), TableTarget::Skip));
+        assert_eq!(
+            (c.tables["a"].clone(), c.tables["b"].clone(), c.tables["c"].clone()),
+            (TableTarget::Rows(1), TableTarget::Rows(20), TableTarget::Skip)
+        );
         assert!(c.schema[0].is_absolute() && c.schema[0].ends_with("ddl/x.sql"), "command-line paths are relative to the current directory");
         let _ = std::fs::remove_file(path);
     }
